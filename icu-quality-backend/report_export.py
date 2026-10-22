@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-report_export.py —《重症质控指标上报（2024年版）》月度 53 项上报值计算。
+report_export.py —《重症质控指标上报》月度上报值计算（含 APACHEⅡ 分段）。
 
 数据口径与看板一致：汇总值走 indicator_list（预聚合 + ICU-05 实时兜底），
 模板特有的拆分（原有/新入、死亡类别、24h APACHE 窗口、仅滤器）在此计算。
@@ -15,9 +15,14 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger("report_export")
 
-# 模板 53 项 key —— 与前端 reportTemplate.js 的 REPORT_ROWS 必须一一对应
+# 模板 key —— 与前端 reportTemplate.js 的 REPORT_ROWS 必须一一对应
+# apache_* 为 APACHEⅡ 分段人数（插在 10.1/10.2 之后，后续编号顺延），
+# 其余 key 保持《重症质控指标上报（2024年版）》原编号（仅 label 展示号顺延）
 REPORT_KEYS = [
-    "2", "3", "5", "6", "8", "10.1", "10.2", "11.1", "11.2",
+    "2", "3", "5", "6", "8",
+    "10.1", "10.2", "apache_lt15_rate",
+    "apache_lt10", "apache_10_15", "apache_15_20", "apache_20_25", "apache_ge25",
+    "11.1", "11.2",
     "15", "16", "17", "18", "20", "21",
     "23.1", "23.2", "24", "25", "26",
     "28", "29", "31.1", "31.2", "33.1", "33.2",
@@ -46,7 +51,7 @@ def _is_carry_in(admit, start_dt) -> bool:
 
 
 def compute_report_values(period: str, icu_unit: str = "all") -> dict:
-    """计算单月 53 项上报值，返回 {period, icu_unit, has_data, values}。"""
+    """计算单月上报值（含 APACHEⅡ 分段），返回 {period, icu_unit, has_data, values}。"""
     ck = (period, icu_unit)
     hit = _VALUES_CACHE.get(ck)
     if hit and time.time() - hit[0] < _VALUES_TTL:
@@ -55,7 +60,8 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
     # 延迟导入避免与 main.py 循环依赖
     from main import indicator_list, _detail_cache_payload, _resolve_dept_codes
     from db import (get_icu_denominator_stays, dedup_persons, person_key_of,
-                    get_dvt_prevention_patients, get_icu11_data, iter_bed_dbs)
+                    get_dvt_prevention_patients, get_icu11_data, iter_bed_dbs,
+                    get_apache_score_bands)
 
     start, end = _month_bounds(period)
     start_dt = datetime.fromisoformat(start)
@@ -98,6 +104,23 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
         carry = sum(1 for p in persons
                     if _is_carry_in(p.get("icuAdmissionTime"), start_dt))
         vals["11.1"], vals["11.2"] = carry, len(persons) - carry
+
+        # ---- 2b. APACHEⅡ 分段人数（插在 10.1/10.2 之后）----
+        # 口径与 ICU-04 一致（同队列、人数去重、当月首次 apacheII total），
+        # 仅分值区间不同；无评分的不进桶。
+        try:
+            bands = get_apache_score_bands(dept_codes, start, end)
+            vals["apache_lt10"] = bands.get("lt10", 0)      # <10
+            vals["apache_10_15"] = bands.get("10_15", 0)    # 10≤·<15
+            vals["apache_15_20"] = bands.get("15_20", 0)    # 15≤·<20
+            vals["apache_20_25"] = bands.get("20_25", 0)    # 20≤·<25
+            vals["apache_ge25"] = bands.get("ge25", 0)      # ≥25
+            # APACHEⅡ＜15分收治率 = 首次评分<15人数 / 同期收治患者总数
+            _den = bands.get("den_count", 0) or 0
+            _lt15 = (bands.get("lt10", 0) or 0) + (bands.get("10_15", 0) or 0)
+            vals["apache_lt15_rate"] = round(_lt15 / _den * 100, 1) if _den > 0 else 0.0
+        except Exception as exc:
+            logger.warning("report_export apache score bands failed: %s", exc)
 
         # 10.1 / 10.2：24h 窗口 APACHE≥15
         pid_to_key = {str(s["_id"]): person_key_of(s)

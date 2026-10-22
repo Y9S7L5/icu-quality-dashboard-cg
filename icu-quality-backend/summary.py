@@ -24,7 +24,7 @@ from db import (
     get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data,
     get_dvt_prevention_patients, get_icu08_data,
     get_patient_census, get_patient_census_detail,
-    get_icu_denominator_stays,
+    get_icu_denominator_stays, get_apache_score_bands,
 )
 
 # ============================================================
@@ -82,6 +82,26 @@ def _compute_icu04(dept_codes, start, end):
     d = get_icu04_apache_data(dept_codes, start, end)
     num = min(d["num_count"], d["den_count"])
     den = d["den_count"]
+    val = round(num / den * 100, 1) if den > 0 else 0.0
+    return {"num": num, "den": den, "val": val, "val_type": "percent"}
+
+
+def _compute_apache_band(band_key: str):
+    """APACHEⅡ 分段人数（ICU-04A～E）：val = 该段患者数。"""
+    def _fn(dept_codes, start, end):
+        d = get_apache_score_bands(dept_codes, start, end)
+        num = int(d.get(band_key, 0) or 0)
+        den = int(d.get("den_count", 0) or 0)
+        return {"num": num, "den": den, "val": num, "val_type": "count"}
+    _fn.__name__ = f"_compute_apache_{band_key}"
+    return _fn
+
+
+def _compute_icu04_lt15(dept_codes, start, end):
+    """ICU-04F: APACHEⅡ＜15分收治率 = 首次评分<15分人数 / 同期收治患者总数。"""
+    d = get_apache_score_bands(dept_codes, start, end)
+    num = int(d.get("lt10", 0) or 0) + int(d.get("10_15", 0) or 0)
+    den = int(d.get("den_count", 0) or 0)
     val = round(num / den * 100, 1) if den > 0 else 0.0
     return {"num": num, "den": den, "val": val, "val_type": "percent"}
 
@@ -596,6 +616,12 @@ INDICATOR_COMPUTERS = {
     "ICU-02": _compute_icu02,
     "ICU-03": _compute_icu03,
     "ICU-04": _compute_icu04,
+    "ICU-04F": _compute_icu04_lt15,
+    "ICU-04A": _compute_apache_band("lt10"),
+    "ICU-04B": _compute_apache_band("10_15"),
+    "ICU-04C": _compute_apache_band("15_20"),
+    "ICU-04D": _compute_apache_band("20_25"),
+    "ICU-04E": _compute_apache_band("ge25"),
     "ICU-05-1h": lambda dc, s, e: _compute_icu05(dc, s, e, "1h"),
     "ICU-05-3h": lambda dc, s, e: _compute_icu05(dc, s, e, "3h"),
     "ICU-05-6h": lambda dc, s, e: _compute_icu05(dc, s, e, "6h"),

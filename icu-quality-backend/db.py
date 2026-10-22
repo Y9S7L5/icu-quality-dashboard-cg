@@ -13,6 +13,12 @@ from dotenv import load_dotenv
 import logging
 
 logger = logging.getLogger("db")
+if not logger.handlers:
+    _diag_handler = logging.StreamHandler()
+    _diag_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_diag_handler)
+logger.setLevel(logging.INFO)
 
 # 医院变体开关（config/bundle_rules.py: BUNDLE_HOSPITAL_VARIANT）
 # cg 变体: 整库路由到 SmartCare_cg / DataCenter_cg + bundle 提取口径切换
@@ -905,6 +911,128 @@ def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> d
 
 
 # ============================================================
+# APACHEⅡ 分段人数（上报表 6–10 行）
+# ============================================================
+
+def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> dict:
+    """
+    返回 {lt10, 10_15, 15_20, 20_25, ge25, scored, den_count,
+         bands: {桶名: [患者明细]}, den_patients}
+
+    队列/人数口径与 ICU-04 完全一致：
+      分母 = get_icu_denominator_stays + dedup_persons（人数口径）。
+    评分口径 = 分母患者中，当月首次 apacheII total（$sort time + $group $first，
+             不设 total 阈值）。无评分的不进桶。
+
+    分值边界（半开区间，与上报表截图 6–10 行一致）：
+      lt10  = total < 10
+      10_15 = 10 ≤ total < 15
+      15_20 = 15 ≤ total < 20
+      20_25 = 20 ≤ total < 25
+      ge25  = total ≥ 25
+    """
+    from datetime import datetime as dt
+
+    start_dt = dt.fromisoformat(start_date)
+    end_dt = dt.fromisoformat(end_date)
+
+    result = {
+        "lt10": 0, "10_15": 0, "15_20": 0, "20_25": 0, "ge25": 0,
+        "scored": 0, "den_count": 0,
+        "bands": {"lt10": [], "10_15": [], "15_20": [], "20_25": [], "ge25": []},
+        "den_patients": [],
+    }
+
+    # 分母：与 ICU-04 完全相同的在科队列 + 人数去重
+    all_stays = get_icu_denominator_stays(dept_codes, start_date, end_date)
+    den_patients = dedup_persons(all_stays)
+    den_ids = [str(p["_id"]) for p in all_stays]
+    result["den_count"] = len(den_patients)
+    result["den_patients"] = den_patients
+    if not den_ids:
+        return result
+
+    def _bucket(total):
+        """按分值落桶；无法转数值的返回 None（不进桶）。"""
+        try:
+            t = float(total)
+        except (TypeError, ValueError):
+            return None
+        if t < 10:
+            return "lt10"
+        if t < 15:
+            return "10_15"
+        if t < 20:
+            return "15_20"
+        if t < 25:
+            return "20_25"
+        return "ge25"
+
+    for db_name, db in iter_bed_dbs():
+        try:
+            # 一次聚合：每患者当月首次 apacheII total（与 get_icu04 同 pipeline，
+            # 但去掉 $match total≥15，保留全部有评分患者）
+            pipeline = [
+                {"$match": {
+                    "pid": {"$in": den_ids},
+                    "scoreType": "apacheII",
+                    "valid": True,
+                    "time": {
+                        "$gte": start_dt,
+                        "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
+                    },
+                }},
+                {"$sort": {"time": 1}},
+                {"$group": {
+                    "_id": "$pid",
+                    "total": {"$first": "$total"},
+                    "score_time": {"$first": "$time"},
+                }},
+            ]
+            first_scores = {s["_id"]: s for s in list(db.score.aggregate(pipeline))}
+
+            # pid → 患者映射（覆盖全部在科记录，含同一患者第二次入科）
+            pat_map = {str(p["_id"]): p for p in all_stays}
+            scored_rows = []
+            for pid_str, s in first_scores.items():
+                p = pat_map.get(pid_str)
+                if not p:
+                    continue
+                scored_rows.append({
+                    "_id": pid_str,
+                    "mrn": p.get("mrn", "") or p.get("hisPid", ""),
+                    "patientId": p.get("patientId", ""),
+                    "name": p.get("name", ""),
+                    "hisBed": p.get("hisBed", ""),
+                    "score": s.get("total"),
+                    "score_time": s.get("score_time"),
+                })
+
+            # 人数口径：同一患者多次入科只保留更早的那次评分（「当月首次」）
+            scored_patients = dedup_persons(scored_rows, time_key="score_time")
+
+            for p in scored_patients:
+                b = _bucket(p.get("score"))
+                if b is None:
+                    continue
+                p = dict(p)
+                p["score"] = float(p["score"]) if p.get("score") is not None else None
+                result["bands"][b].append(p)
+
+            for b in ("lt10", "10_15", "15_20", "20_25", "ge25"):
+                result[b] = len(result["bands"][b])
+            result["scored"] = sum(result[b] for b in
+                                   ("lt10", "10_15", "15_20", "20_25", "ge25"))
+            break
+
+        except Exception as _exc:
+            logger.warning("DB %s failed in get_apache_score_bands: %s", db_name, _exc)
+            continue
+
+    return result
+
+
+# ============================================================
 # ICU-05：感染性休克 Bundle 完成率（1h/3h/6h）
 # ============================================================
 
@@ -1364,20 +1492,27 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
         if not t0 or not sc_pid:
             pat["event_mapping_status"] = pat.get("event_mapping_status", "MISSING_EVENT_ID")
             continue
+        _v3_step = "init"
         try:
+            _v3_step = "exclusion_key"
             event_id = str(pat.get("dc_pid") or pat.get("_id") or sc_pid)
             pat["detail_id"] = build_exclusion_key(event_id, t0)
             pat["exclusion_key"] = pat["detail_id"]
+            _v3_step = "judge_bundle_v3_for_patient"
             v3 = judge_bundle_v3_for_patient(sc_pid, resolve_bundle_dc_pid(pat), pat.get("mrn", ""), t0, diag,
                                             batch_lab_cache=batch_lab_cache)
+            _v3_step = "post_judge"
             pat["v3"] = v3
             # 分母判定: 使用候选引擎 (高召回四通道)
             # 休克确认: bundle_rules.SHOCK_RULE 口径 → _septic_shock_confirmed
             # 新口径: candidate_info 由 judge_bundle_v3_for_patient 唯一计算，此处直接复用
             cl = v3.get("clinical_layer") or {}
-            shock_layer = cl.get("layer4_shock", {})
+            # #fix: .get(key, {}) 在 key 存在且值为 None 时仍返回 None
+            shock_layer = cl.get("layer4_shock") or {}
+            _v3_step = "septic_shock_confirmed"
             old_shock_confirmed = _septic_shock_confirmed(v3)
             # 候选引擎集成: 复用 v3["candidate_info"]，不重复调用 extract_candidate
+            _v3_step = "candidate_info"
             candidate_info = v3.get("candidate_info")
             if candidate_info and candidate_info.get("candidate_status"):
                 pat["candidate_info"] = candidate_info
@@ -1402,11 +1537,13 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
                 pat["candidate_pathways"] = ["engine_error"]
                 pat["clinical_confirmation_status"] = "insufficient"
             # 影子比对字段保留
+            _v3_step = "shock_status_new"
             pat["shock_status_new"] = shock_layer.get("shock_status")
             pat["sofa2_total"] = (cl.get("layer2_organ_dysfunction") or {}).get("sofa2_total")
             # 旧口径分子: K1 AND K2 (正式分子)
             # #fix: .get(key, {}) returns None when key exists with None value
             # Use (d.get(key) or {}) to safely default to empty dict
+            _v3_step = "bundles"
             bundle_1h = v3.get("bundle_1h") or {}
             bundle_3h = v3.get("bundle_3h") or {}
             bundle_6h = v3.get("bundle_6h") or {}
@@ -1434,7 +1571,9 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
                     if not old_shock_confirmed:
                         result.setdefault("shadow_h6_patients", []).append(pat)
         except Exception as _exc:
-            logger.warning("V3 judgment failed for %s: %s", pat.get("mrn"), _exc)
+            import traceback
+            logger.warning("V3 judgment failed for %s: %s\n%s",
+                           pat.get("mrn"), _exc, traceback.format_exc())
             continue
 
     # 重新计算分母
@@ -3196,12 +3335,12 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
         patient_data['w3h']['blood_gas_time'] = bg_3h
         patient_data['w6h']['blood_gas_time'] = bg_6h
 
-    result = judge_bundle_v3(patient_data)
+    result = judge_bundle_v3(patient_data) or {}
 
     # Gate fields are encounter-level evidence and remain available to the
     # existing detail schema.  Window-specific fields stay under bundle_1h /
     # bundle_3h and are never flattened into one ambiguous result.
-    result.update(result.get('gate', {}))
+    result.update(result.get('gate', {}) or {})
 
     # 附加原始数据明细
     result.update({
@@ -3283,12 +3422,12 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
         # ---- 新旧门控对比 (shadow 模式) ----
         if SOFA_GATE_MODE == "shadow":
             old_gate = result.get('gate', {})
-            sofa2_score = sofa_result['sofa2'].get('sofa2_score')
-            new_organ_dys = clinical_layer['layer2_organ_dysfunction'].get('has_acute_organ_dysfunction')
-            old_organ_dys = old_gate.get('has_organ_dysfunction')
-            new_sepsis = clinical_layer['layer3_sepsis'].get('is_sepsis')
-            old_shock = old_gate.get('is_septic_shock')
-            new_shock = clinical_layer['layer4_shock'].get('shock_status')
+            sofa2_score = (sofa_result.get('sofa2') or {}).get('sofa2_score')
+            new_organ_dys = (clinical_layer.get('layer2_organ_dysfunction') or {}).get('has_acute_organ_dysfunction')
+            old_organ_dys = (old_gate or {}).get('has_organ_dysfunction')
+            new_sepsis = (clinical_layer.get('layer3_sepsis') or {}).get('is_sepsis')
+            old_shock = (old_gate or {}).get('is_septic_shock')
+            new_shock = (clinical_layer.get('layer4_shock') or {}).get('shock_status')
 
             result['gate_comparison'] = {
                 'mode': 'shadow',
@@ -3302,7 +3441,7 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
                                  (old_shock is not True and new_shock == 'confirmed'),
             }
     except Exception as e:
-        logger.warning("SOFA scoring failed for sc_pid=%s: %s", sc_pid, e)
+        logger.warning("SOFA scoring failed for sc_pid=%s: %s", sc_pid, e, exc_info=True)
         result['sofa'] = None
         result['clinical_layer'] = None
         result['gate_comparison'] = {'mode': 'shadow', 'error': str(e)}
@@ -3331,7 +3470,7 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
         result['missing_evidence'] = candidate_info.get('missing_evidence', [])
         result['conflicting_evidence'] = candidate_info.get('conflicting_evidence', [])
     except Exception as e:
-        logger.warning("Candidate engine failed for sc_pid=%s: %s", sc_pid, e)
+        logger.warning("Candidate engine failed for sc_pid=%s: %s", sc_pid, e, exc_info=True)
         result['candidate_info'] = {'candidate_status': 'not_candidate', 'is_septic_shock_candidate': False}
         result['candidate_status'] = 'not_candidate'
         result['is_septic_shock_candidate'] = False

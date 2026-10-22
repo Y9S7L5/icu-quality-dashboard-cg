@@ -549,6 +549,12 @@ INDICATORS_CONFIG = {
     "ICU-02": {"name": "ICU医师床位比", "unit": ":1", "good": (0.8, 99), "warn": (0.5, 99), "dir": "higher"},
     "ICU-03": {"name": "ICU护士床位比", "unit": ":1", "good": (3.0, 99), "warn": (2.5, 99), "dir": "higher"},
     "ICU-04": {"name": "APACHEⅡ≥15分收治率", "unit": "%", "good": (50, 100), "warn": (30, 100), "dir": "higher"},
+    "ICU-04F": {"name": "APACHEⅡ＜15分收治率", "unit": "%", "good": (0, 50), "warn": (0, 70), "dir": "lower"},
+    "ICU-04A": {"name": "APACHEⅡ评分<10分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04B": {"name": "10≤APACHEⅡ评分<15分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04C": {"name": "15≤APACHEⅡ评分<20分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04D": {"name": "20≤APACHEⅡ评分<25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04E": {"name": "APACHEⅡ评分≥25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
     "ICU-05-1h": {"name": "感染性休克1h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-05-3h": {"name": "感染性休克3h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-05-6h": {"name": "感染性休克6h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
@@ -581,6 +587,12 @@ SOURCE_DESC = {
     "ICU-02": {"numerator": "ICU在岗执业医师总人数", "denominator": "实际开放床位数总和"},
     "ICU-03": {"numerator": "ICU在岗执业护士总人数", "denominator": "实际开放床位数总和"},
     "ICU-04": {"numerator": "首次APACHEⅡ评分≥15分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04F": {"numerator": "首次APACHEⅡ评分<15分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04A": {"numerator": "首次APACHEⅡ评分<10分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04B": {"numerator": "首次APACHEⅡ评分10～14分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04C": {"numerator": "首次APACHEⅡ评分15～19分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04D": {"numerator": "首次APACHEⅡ评分20～24分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04E": {"numerator": "首次APACHEⅡ评分≥25分的患者数", "denominator": "同期入住ICU的患者总人数"},
     "ICU-05-1h": {"numerator": "1h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-3h": {"numerator": "3h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-6h": {"numerator": "6h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
@@ -660,6 +672,9 @@ def _summary_row_to_api(r: dict) -> dict:
 
 
 def _calc_value(code: str, numerator: float, denominator: float) -> float:
+    if code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E"):
+        # APACHE 分段：值 = 该段患者人数
+        return float(numerator or 0)
     if denominator <= 0:
         return 0.0
     if code == "ICU-11":
@@ -1253,6 +1268,52 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 })
             _enrich_admission_discharge(items, dept_codes)
             return items
+
+    # ---- ICU-04A～E / ICU-04F：APACHEⅡ 分段明细 ----
+    if code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E", "ICU-04F"):
+        from db import get_apache_score_bands
+        data = get_apache_score_bands(dept_codes, start_date, end_date)
+        if part == "numerator":
+            if code == "ICU-04F":
+                band_rows = (data.get("bands") or {}).get("lt10", []) + \
+                            (data.get("bands") or {}).get("10_15", [])
+            else:
+                band_key = {"ICU-04A": "lt10", "ICU-04B": "10_15", "ICU-04C": "15_20",
+                            "ICU-04D": "20_25", "ICU-04E": "ge25"}[code]
+                band_rows = (data.get("bands") or {}).get(band_key, [])
+            items = []
+            for p in band_rows:
+                items.append({
+                    "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                    "name": p.get("name", "-"),
+                    "gender": "",
+                    "age": "",
+                    "bed_no": p.get("hisBed", ""),
+                    "dept": "",
+                    "admit_time": p.get("score_time").strftime("%Y-%m-%d %H:%M") if p.get("score_time") else "-",
+                    "discharge_time": "",
+                    "admission_source": "",
+                    "value": p.get("score", 0),
+                })
+            _enrich_admission_discharge(items, dept_codes)
+            return items
+        items = []
+        for p in data.get("den_patients", []):
+            items.append({
+                "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                "name": p.get("name", "-"),
+                "gender": "",
+                "age": "",
+                "bed_no": p.get("hisBed", ""),
+                "dept": "",
+                "admit_time": p.get("icuAdmissionTime").strftime("%Y-%m-%d %H:%M") if p.get("icuAdmissionTime") else "-",
+                "discharge_time": "",
+                "admission_source": "",
+                "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
+                "value": 1,
+            })
+        _enrich_admission_discharge(items, dept_codes)
+        return items
 
     # ---- ICU-05-1h/3h/6h：Bundle 明细 (V3) ----
     if code in ("ICU-05-1h", "ICU-05-3h", "ICU-05-6h"):
@@ -2742,6 +2803,8 @@ def indicator_list(period: str, icu_unit: str = "all", end_period: str = "", noc
         for code, v in agg.items():
             if v["num"] is None or v["den"] is None:
                 val = None
+            elif code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E"):
+                val = float(v["num"] or 0)  # APACHE 分段：值=人数
             elif code == "ICU-11":
                 val = round(v["num"] / v["den"], 2) if v["den"] > 0 else 0
             elif v["unit"] == "‰":
@@ -3000,6 +3063,20 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
     elif code == "ICU-04":
         source_desc = "分子：来自 score 表，当月首次 APACHEⅡ 评分 total ≥ 15 的患者" if part == "numerator" \
             else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人数口径 —— 按住院号去重，同一患者当月多次入科只算一人"
+    elif code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E", "ICU-04F"):
+        band_desc = {
+            "ICU-04A": "APACHEⅡ < 10 分",
+            "ICU-04B": "10 ≤ APACHEⅡ < 15 分",
+            "ICU-04C": "15 ≤ APACHEⅡ < 20 分",
+            "ICU-04D": "20 ≤ APACHEⅡ < 25 分",
+            "ICU-04E": "APACHEⅡ ≥ 25 分",
+            "ICU-04F": "APACHEⅡ < 15 分",
+        }[code]
+        source_desc = (
+            f"分子：来自 score 表，当月首次 APACHEⅡ 评分落入「{band_desc}」的患者（人数口径）"
+            if part == "numerator"
+            else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人数口径 —— 按住院号去重，与 ICU-04 同队列"
+        )
     elif code in ("ICU-05-1h", "ICU-05-3h", "ICU-05-6h"):
         h = code.split("-")[2]
         # 人话文案（#设计: 替换原 V3/K1/A1/B3 技术黑话）

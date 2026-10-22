@@ -182,7 +182,7 @@ function buildSheet(values) {
     rows.push(`<row r="${r}" ht="25" customHeight="1">`
       + `<c r="A${r}" s="1" t="inlineStr"><is><t>${esc(row.label)}</t></is></c>${b}</row>`);
   });
-  const lastRow = REPORT_ROWS.length + 2; // 53 项 → 第55行
+  const lastRow = REPORT_ROWS.length + 2; // 动态行数（当前 56 项 → 第58行）
   return `${XML_HEAD}
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <dimension ref="A1:B${lastRow}"/>
