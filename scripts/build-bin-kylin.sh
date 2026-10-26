@@ -11,6 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BASE_IMAGE="${BASE_IMAGE:-kylin-server:v11}"
+FALLBACK_IMAGE="${FALLBACK_IMAGE:-openeuler/openeuler:24.03-lts}"
 IMAGE_NAME="${IMAGE_NAME:-icu-qc-kylin-bin}"
 DOCKERFILE="${DOCKERFILE:-deploy/kylin-v11/Dockerfile.bin}"
 OUT_DIR="${OUT_DIR:-dist-kylin}"
@@ -34,11 +35,21 @@ if [ ! -f icu-quality-backend/frontend_dist/index.html ] || [ "${SYNC_FRONTEND:-
 fi
 
 # 2) 基础镜像
+#    首选自制 kylin-server:v11；本机没有时自动回退到同源的 openEuler 24.03
+#    （glibc 2.38 / Python 3.11，与麒麟 V11 同源，产物兼容性一致）。
+if [ "$BASE_IMAGE" = "kylin-server:v11" ] \
+   && ! "$ENGINE" image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+  log "本地无自制镜像 $BASE_IMAGE，自动回退 $FALLBACK_IMAGE"
+  log "（openEuler 系，与麒麟 V11 同源；若要纯麒麟环境，先在已激活的麒麟 V11 主机执行 deploy/kylin-v11/make-base-image.sh）"
+  BASE_IMAGE="$FALLBACK_IMAGE"
+fi
 "$ENGINE" image inspect "$BASE_IMAGE" >/dev/null 2>&1 || {
   log "本地无 $BASE_IMAGE，尝试拉取"
-  "$ENGINE" pull "$BASE_IMAGE" || die "没有麒麟 V11 基础镜像。
-在一台已激活的麒麟 V11 主机上执行 deploy/kylin-v11/make-base-image.sh 自制后重跑。"
+  "$ENGINE" pull "$BASE_IMAGE" || die "拉取基础镜像失败：$BASE_IMAGE
+可指定 BASE_IMAGE=... 覆盖，或在已激活的麒麟 V11 主机上执行
+deploy/kylin-v11/make-base-image.sh 自制 kylin-server:v11 后重跑。"
 }
+log "使用基础镜像: $BASE_IMAGE"
 
 # 3) 编译
 log "编译二进制（首次约 3-6 分钟）"
