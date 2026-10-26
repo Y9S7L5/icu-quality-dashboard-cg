@@ -43,21 +43,21 @@ export const INDICATORS = [
     meaning: '反映ICU人力资源配置', chart: 'bar',
   },
   {
-    code: 'ICU-04', name: 'APACHEⅡ≥15分收治率', type: 'ratio', unit: '%',
+    code: 'ICU-04-01', name: 'APACHEⅡ≥15分收治率', type: 'ratio', unit: '%',
     numerator: '首次APACHEⅡ≥15分患者数', denominator: '同期收治患者总数',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [50, 100], warn: [30, 100] },
     meaning: '反映收治患者病情危重程度', chart: 'gauge',
   },
   {
-    code: 'ICU-04F', name: 'APACHEⅡ＜15分收治率', type: 'ratio', unit: '%',
+    code: 'ICU-04-02', name: 'APACHEⅡ＜15分收治率', type: 'ratio', unit: '%',
     numerator: '首次APACHEⅡ＜15分患者数', denominator: '同期收治患者总数',
     multiplier: 100, direction: 'lower_better',
     thresholds: { good: [0, 50], warn: [0, 70] },
     meaning: '反映收治患者中病情相对较轻的比例', chart: 'gauge',
   },
   {
-    code: 'ICU-04A', name: 'APACHEⅡ评分<10分患者总数', type: 'count', unit: '人',
+    code: 'ICU-04-03', name: 'APACHEⅡ评分<10分患者总数', type: 'count', unit: '人',
     numerator: '首次APACHEⅡ<10分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
@@ -65,7 +65,7 @@ export const INDICATORS = [
     meaning: 'APACHEⅡ评分结构分布：<10分', chart: 'bar',
   },
   {
-    code: 'ICU-04B', name: '10≤APACHEⅡ评分<15分患者总数', type: 'count', unit: '人',
+    code: 'ICU-04-04', name: '10≤APACHEⅡ评分<15分患者总数', type: 'count', unit: '人',
     numerator: '首次APACHEⅡ 10～14分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
@@ -73,7 +73,7 @@ export const INDICATORS = [
     meaning: 'APACHEⅡ评分结构分布：10≤评分<15', chart: 'bar',
   },
   {
-    code: 'ICU-04C', name: '15≤APACHEⅡ评分<20分患者总数', type: 'count', unit: '人',
+    code: 'ICU-04-05', name: '15≤APACHEⅡ评分<20分患者总数', type: 'count', unit: '人',
     numerator: '首次APACHEⅡ 15～19分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
@@ -81,7 +81,7 @@ export const INDICATORS = [
     meaning: 'APACHEⅡ评分结构分布：15≤评分<20', chart: 'bar',
   },
   {
-    code: 'ICU-04D', name: '20≤APACHEⅡ评分<25分患者总数', type: 'count', unit: '人',
+    code: 'ICU-04-06', name: '20≤APACHEⅡ评分<25分患者总数', type: 'count', unit: '人',
     numerator: '首次APACHEⅡ 20～24分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
@@ -89,7 +89,7 @@ export const INDICATORS = [
     meaning: 'APACHEⅡ评分结构分布：20≤评分<25', chart: 'bar',
   },
   {
-    code: 'ICU-04E', name: 'APACHEⅡ评分≥25分患者总数', type: 'count', unit: '人',
+    code: 'ICU-04-07', name: 'APACHEⅡ评分≥25分患者总数', type: 'count', unit: '人',
     numerator: '首次APACHEⅡ≥25分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },

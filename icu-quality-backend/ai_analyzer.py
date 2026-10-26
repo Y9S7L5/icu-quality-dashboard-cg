@@ -8,7 +8,7 @@ INDICATOR_META = {
     "ICU-01": {"name": "ICU床位使用率", "unit": "%", "good": (75, 90), "warn": (60, 95), "dir": "range"},
     "ICU-02": {"name": "ICU医师床位比", "unit": ":1", "good": (0.8, 99), "warn": (0.5, 99), "dir": "higher"},
     "ICU-03": {"name": "ICU护士床位比", "unit": ":1", "good": (3.0, 99), "warn": (2.5, 99), "dir": "higher"},
-    "ICU-04": {"name": "APACHEⅡ≥15分收治率", "unit": "%", "good": (50, 100), "warn": (30, 100), "dir": "higher"},
+    "ICU-04-01": {"name": "APACHEⅡ≥15分收治率", "unit": "%", "good": (50, 100), "warn": (30, 100), "dir": "higher"},
     "ICU-05": {"name": "感染性休克bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-06": {"name": "抗菌药物前病原学送检率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-07": {"name": "DVT预防率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
@@ -169,6 +169,7 @@ import hashlib
 import re
 import threading
 from datetime import datetime as _dt
+from tzutil import fmt_bj  # noqa: E402 — naive UTC → 北京展示
 
 # AI 并发控制
 _AI_SEMAPHORE = threading.Semaphore(5)
@@ -599,13 +600,15 @@ def get_all_ai_decisions(dept_codes: list = None, period_start: str = None,
         try:
             db = get_client(db_name)[db_name]
             query = {"task": "abx_purpose"}
+            # created_at 存储为真 UTC → 查询边界北京−8h（tzutil 入口转换）
+            from datetime import timedelta as _td
             if period_start:
                 query["created_at"] = query.get("created_at", {})
-                query["created_at"]["$gte"] = _dt.fromisoformat(period_start)
+                query["created_at"]["$gte"] = _dt.fromisoformat(period_start) - _td(hours=8)
             if period_end:
                 query["created_at"] = query.get("created_at", {})
                 query["created_at"]["$lte"] = _dt.fromisoformat(
-                    f"{period_end}-31" if len(period_end) == 7 else period_end)
+                    f"{period_end}-31" if len(period_end) == 7 else period_end) - _td(hours=8)
             if min_confidence is not None:
                 query["result.confidence"] = {"$lte": float(min_confidence)}
 
@@ -627,7 +630,7 @@ def get_all_ai_decisions(dept_codes: list = None, period_start: str = None,
         "confidence": d.get("result", {}).get("confidence", 0),
         "reason": d.get("result", {}).get("reason", ""),
         "decided_by": d.get("result", {}).get("by", "ai"),
-        "created_at": d.get("created_at").isoformat() if d.get("created_at") else "",
+        "created_at": fmt_bj(d.get("created_at")) if d.get("created_at") else "",
     } for d in results]
 
 

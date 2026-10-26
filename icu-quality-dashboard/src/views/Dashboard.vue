@@ -443,7 +443,7 @@ const zoneStats = computed(() => {
 });
 
 // ---- KPI 六宫格 ----
-const kpiCardCodes = ['ICU-01', 'ICU-04', 'ICU-06', 'ICU-11', 'ICU-16', 'ICU-17'];
+const kpiCardCodes = ['ICU-01', 'ICU-04-01', 'ICU-06', 'ICU-11', 'ICU-16', 'ICU-17'];
 const kpiCards = computed(() => {
   return kpiCardCodes.map(code => {
     const row = rowsByCode.value[code];

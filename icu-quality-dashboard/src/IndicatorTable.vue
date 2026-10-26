@@ -195,7 +195,9 @@ function displayCode(code) {
 }
 function codeOrder(code) {
   const shown = displayCode(code);
-  const match = shown.match(/^ICU-(\d+)(?:-(\d+)h)?$/);
+  // 支持 ICU-03 / ICU-04-01 / ICU-05-1h：主号×100+后缀序号
+  // ICU-04-01~07 → 401~407，落在 ICU-03(300) 与 ICU-05-1h(501) 之间
+  const match = shown.match(/^ICU-(\d+)(?:-(\d+)h?)?$/);
   if (!match) return Number.MAX_SAFE_INTEGER;
   return Number(match[1]) * 100 + Number(match[2] || 0);
 }
