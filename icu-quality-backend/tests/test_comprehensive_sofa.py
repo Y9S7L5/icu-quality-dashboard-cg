@@ -52,7 +52,7 @@ def _utc(y, m, d, h=0, mi=0):
 
 
 def _sh(y, m, d, h=0, mi=0):
-    """创建 Asia/Shanghai naive 时间（数据库原始格式）"""
+    """创建 naive 时间（数据库原始格式，naive = 真 UTC 墙钟）"""
     return datetime(y, m, d, h, mi, 0)
 
 

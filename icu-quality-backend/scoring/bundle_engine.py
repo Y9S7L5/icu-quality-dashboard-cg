@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import config.bundle_rules as _br
 import config.indicator_windows as _iw
 
+from tzutil import as_utc  # noqa: E402 — naive = 真 UTC（收敛点）
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -96,19 +98,9 @@ COLLOID_KEYWORDS = {
 
 def _aware(dt: datetime) -> datetime:
     """
-    确保时区感知。
-    数据库 naive 时间视为 Asia/Shanghai，显式本地化后转 UTC。
-    禁止直接 replace(tzinfo=UTC) — 那会把本地时间错误地标为 UTC。
+    确保时区感知。naive = 真 UTC（存储帧铁律，2026-10 实证）→ tzutil.as_utc。
     """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        return dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
-    return dt
+    return as_utc(dt)
 
 
 def _in_window(ts: datetime, start: datetime, end: datetime) -> bool:

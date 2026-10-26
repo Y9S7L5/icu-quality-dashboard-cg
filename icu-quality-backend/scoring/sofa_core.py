@@ -23,6 +23,8 @@ from .adapter import ne_ugkgmin as _ne_ugkgmin, canon_drug  # noqa: F401 — 唯
 from .missing_policy import apply_policy as _apply_policy
 import config.indicator_windows as _cfg
 
+from tzutil import as_utc  # noqa: E402 — naive = 真 UTC（收敛点）
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------
@@ -145,12 +147,7 @@ def _urine_in_window(
         ts = o.get("observed_at")
         if not isinstance(ts, datetime):
             continue
-        if ts.tzinfo is None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            ts = ts.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        ts = as_utc(ts)
         if ts < window_start or ts > eval_time:
             continue
         candidates.append((float(raw_val), o.get("unit", ""), ts))
@@ -229,12 +226,7 @@ def _worst_in_window(
         ts = obs.get("observed_at")
         if not isinstance(ts, datetime):
             continue
-        if ts.tzinfo is None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            ts = ts.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        ts = as_utc(ts)
         if ts < window_start or ts > eval_time:
             continue
         candidates.append((float(raw_val), obs.get("unit", ""), ts))
@@ -294,12 +286,7 @@ def _worst_pf_pair_in_window(
         ts = o.get("observed_at")
         if not isinstance(ts, datetime):
             continue
-        if ts.tzinfo is None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            ts = ts.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        ts = as_utc(ts)
         if ts < window_start or ts > eval_time:
             continue
         val = float(raw_val)
@@ -584,12 +571,7 @@ def _lowest_gcs_in_window(
         ts = o.get("observed_at")
         if not isinstance(ts, datetime):
             continue
-        if ts.tzinfo is None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            ts = ts.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        ts = as_utc(ts)
         if ts < window_start or ts > eval_time:
             continue
 

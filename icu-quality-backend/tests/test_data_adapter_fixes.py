@@ -20,11 +20,9 @@ from scoring.data_adapter import (
 
 
 def _aware(dt):
-    """Make naive datetime aware as Asia/Shanghai then convert to UTC."""
-    from zoneinfo import ZoneInfo
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
-    return dt
+    """naive = 真 UTC（存储帧铁律，2026-10 实证）→ aware UTC。"""
+    from tzutil import as_utc
+    return as_utc(dt)
 
 
 class TestBGACodeMapping:

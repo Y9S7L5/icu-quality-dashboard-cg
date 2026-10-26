@@ -14,23 +14,16 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from tzutil import as_utc  # noqa: E402 — naive = 真 UTC（收敛点）
+
 logger = logging.getLogger(__name__)
 
 
 def _aware(dt: datetime) -> datetime:
     """
-    确保时区感知。
-    数据库 naive 时间视为 Asia/Shanghai，显式本地化后转 UTC。
+    确保时区感知。naive = 真 UTC（存储帧铁律，2026-10 实证）→ tzutil.as_utc。
     """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        return dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
-    return dt
+    return as_utc(dt)
 
 
 def compute_sofa_scores(

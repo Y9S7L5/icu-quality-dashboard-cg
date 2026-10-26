@@ -17,15 +17,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
-
 logger = logging.getLogger(__name__)
 
-# 医院时区: 默认 Asia/Shanghai
-_HOSPITAL_TZ = ZoneInfo("Asia/Shanghai")
+from tzutil import as_utc  # noqa: E402 — naive = 真 UTC（收敛点）
 
 # $in 列表分块大小
 CHUNK_SIZE = 200
@@ -43,14 +37,9 @@ LAB_MAP = {
 
 def _aware(dt: datetime) -> datetime:
     """
-    确保时区感知。
-    数据库 naive 时间视为 Asia/Shanghai，显式本地化后转 UTC。
+    确保时区感知。naive = 真 UTC（存储帧铁律，2026-10 实证）→ tzutil.as_utc。
     """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=_HOSPITAL_TZ).astimezone(timezone.utc)
-    return dt
+    return as_utc(dt)
 
 
 def _safe_float(val) -> Optional[float]:
@@ -369,8 +358,8 @@ def _process_exam_items(
 
         # 时间窗口校验
         collect_time_aware = _aware(collect_time)
-        # #fix: window_start/eval_time 是 naive(本地)，collect_time_aware 是 UTC-aware，
-        # 直接比较抛 TypeError（此前子表恒空未触发）
+        # window_start/eval_time 为 naive(=真UTC)，collect_time_aware 是 UTC-aware，
+        # 统一经 _aware 归一后比较，避免 naive/aware 混比 TypeError
         ws_aware = _aware(window_start)
         ev_aware = _aware(eval_time)
         if collect_time_aware < ws_aware or collect_time_aware > ev_aware:

@@ -8,7 +8,8 @@ MongoDB → SOFA 评分器数据适配层。
   - 缺失数据返回空列表，不得编造观测值
   - 所有 datetime 统一为 timezone-aware (UTC)
   - 单位字段如实传递，不做跨单位转换（由评分器负责）
-  - 数据库 naive 时间视为 Asia/Shanghai，显式本地化后转 UTC
+  - 数据库 naive 时间 = 真 UTC 墙钟（存储帧铁律，2026-10 实证），
+    经 tzutil.as_utc 归一，勿再按 Asia/Shanghai 平移（会 −8h）
 """
 from __future__ import annotations
 
@@ -16,29 +17,9 @@ import logging
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
-
 logger = logging.getLogger(__name__)
 
-# 医院时区: 默认 Asia/Shanghai
-_HOSPITAL_TZ = ZoneInfo("Asia/Shanghai")
-
-
-def _aware(dt: datetime) -> datetime:
-    """
-    确保时区感知。
-    数据库 naive 时间视为 Asia/Shanghai，显式本地化后转 UTC。
-    禁止直接 replace(tzinfo=UTC) — 那会把本地时间错误地标为 UTC。
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        # naive 时间 → 假设为 Asia/Shanghai → 转 UTC
-        return dt.replace(tzinfo=_HOSPITAL_TZ).astimezone(timezone.utc)
-    return dt
+from tzutil import as_utc as _aware  # noqa: E402 — naive = 真 UTC（收敛点）
 
 
 def _safe_float(val) -> Optional[float]:
