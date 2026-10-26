@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from datetime import date, datetime, timedelta
+from tzutil import as_utc, fmt_bj, to_bj_naive, utc_day_start, utc_day_end_wide
 from ai_analyzer import analyze, get_all_ai_decisions, override_ai_decision, ensure_ai_cache_collection as ensure_ai_cache
 from db import assert_db_ready, get_open_bed_count, get_occupied_bed_days, get_staff_count, get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, judge_bundle_v3_for_patient, get_icu08_data, get_icu06_data, get_icu09_data, get_icu10_data, get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data, get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data, get_tri_tube_suspected_warnings, get_sepsis_alert_warnings, confirm_tri_tube_warning, get_dvt_prevention_patients, get_client, BED_DB_NAMES, PROFESSION_CN, get_patient_census, get_patient_census_detail, iter_bed_dbs, resolve_bundle_dc_pid
 import random
@@ -241,9 +242,9 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 16  # v11: ICU-07 口径修复(分母队列反查pid/剔假匹配/气压治疗)
+CACHE_VERSION = 22  # v11: ICU-07 口径修复(分母队列反查pid/剔假匹配/气压治疗)
                     # v12: ICU-07 明细统一住院号=mrn + detail_id=在科记录_id(分子分母可逐行对账)
-                    # v13: ICU-04/07/09/10 统一**人数口径**(按 mrn 去重，
+                    # v13: ICU-04-01/07/09/10 统一**人数口径**(按 mrn 去重，
                     #      与 INDICATORS_CONFIG「患者数」定义一致；明细一人一行)
                     # v14: 跨月明细按「统计月+患者」成行 —— 与汇总逐月相加口径对齐，
                     #      tab 行数 == 公式条分子/分母（stat_month 字段供统计月列展示）
@@ -253,6 +254,21 @@ CACHE_VERSION = 16  # v11: ICU-07 口径修复(分母队列反查pid/剔假匹�
                     #      reportID→examID、窗口比较 naive/aware 时区) —— ICU-06 等
                     #      依赖检验的明细按新数据重算（修复前 list 已重建但明细
                     #      缓存仍是旧值，出现 list 313 vs detail 319 不一致）
+                    # v17: 时区统一(真 UTC 架构)——查询边界北京−8h、明细展示 +8h
+                    #      (北京时间)、床日/设备日北京日切；旧明细缓存(UTC 串)作废
+                    # v18: ICU-00 患者动态明细修复——前端 numerator/denominator 映射到
+                    #      carry_in/total(census 口径，原先返回 [] 被缓存成"暂无明细")，
+                    #      入出科时间不再双 fmt(+16h)；旧 census part 缓存与空缓存作废
+                    # v19: ICU-04/07/09/10 取消按 mrn 去重（人次口径，分母=在科记录数），
+                    #      分子从分母每条在科记录出发、窗口=本次住院 [入科,出科∧月末]，
+                    #      原有患者入科当月(上个月)做的评分/评估/医嘱不再漏计
+                    # v20: _stay_window 终点加出科后 24h 宽限——出科触发的评分补录
+                    #      (陈杰新+8s、游绍禄+9.7h)不再被上界滤掉（对账院端明细 51 例）
+                    # v21: 同期总数类指标(ICU-04/07/09/10)明细补 患者类型(分子侧)、
+                    #      出科时间、分母 eval_status(未评/已评、07 未预防/已预防)——
+                    #      前端可按 原有/新入/出科/未评 筛选；旧明细缓存作废
+                    # v22: ICU-04 分母明细 value 改为首次 APACHEⅡ 分值(原恒 1)，
+                    #      口径文案改人次口径——核对 分子(≥15)+ICU-04-02分子+未评=分母
 
 
 def _dept_cache_key(dept_codes: list) -> str:
@@ -453,6 +469,13 @@ def _write_detail_cache(dept_codes: list, period: str, code: str, part: str, ite
 
 
 def _detail_cache_payload(code: str, period: str, part: str, icu_unit: str, nocache: bool = False):
+    # ICU-00：前端固定用 numerator/denominator 下钻，映射到患者动态真实口径 ——
+    # 分子=期初原有(carry_in)、分母=同期患者总数(total=原有+新入)，与公式条同口径。
+    # 缓存键随之用 census part，可直接命中 rebuild_detail_cache 预计算的 carry_in，
+    # 并避开早期误写在 numerator/denominator 键下的空明细缓存（get_patient_census_detail
+    # 过去不认识这两个 part，返回 [] 被缓存）。
+    if code == "ICU-00":
+        part = {"numerator": "carry_in", "denominator": "total"}.get(part, part)
     dept_codes = _resolve_dept_codes(icu_unit)
     if _is_historical_period(period) and not nocache:
         cached = _read_detail_cache(dept_codes, period, code, part)
@@ -468,7 +491,7 @@ def rebuild_detail_cache(dept_codes: list, periods: list, indicators: list = Non
                          icu_unit: str = "all", progress_callback=None) -> dict:
     indicators = indicators or list(summary_module.INDICATOR_COMPUTERS.keys())
     stats = {"total": 0, "success": 0, "failed": 0, "errors": []}
-    census_parts = ("carry_in", "new_admit", "discharge")
+    census_parts = ("carry_in", "new_admit", "discharge", "total")
     tasks = [(p, c, part) for p in periods if _is_historical_period(p)
              for c in indicators for part in (("numerator", "denominator") if c != "ICU-00" else census_parts)]
     for period, code, part in tasks:
@@ -548,13 +571,13 @@ INDICATORS_CONFIG = {
     "ICU-01": {"name": "ICU床位使用率", "unit": "%", "good": (75, 90), "warn": (60, 95), "dir": "range"},
     "ICU-02": {"name": "ICU医师床位比", "unit": ":1", "good": (0.8, 99), "warn": (0.5, 99), "dir": "higher"},
     "ICU-03": {"name": "ICU护士床位比", "unit": ":1", "good": (3.0, 99), "warn": (2.5, 99), "dir": "higher"},
-    "ICU-04": {"name": "APACHEⅡ≥15分收治率", "unit": "%", "good": (50, 100), "warn": (30, 100), "dir": "higher"},
-    "ICU-04F": {"name": "APACHEⅡ＜15分收治率", "unit": "%", "good": (0, 50), "warn": (0, 70), "dir": "lower"},
-    "ICU-04A": {"name": "APACHEⅡ评分<10分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
-    "ICU-04B": {"name": "10≤APACHEⅡ评分<15分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
-    "ICU-04C": {"name": "15≤APACHEⅡ评分<20分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
-    "ICU-04D": {"name": "20≤APACHEⅡ评分<25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
-    "ICU-04E": {"name": "APACHEⅡ评分≥25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04-01": {"name": "APACHEⅡ≥15分收治率", "unit": "%", "good": (50, 100), "warn": (30, 100), "dir": "higher"},
+    "ICU-04-02": {"name": "APACHEⅡ＜15分收治率", "unit": "%", "good": (0, 50), "warn": (0, 70), "dir": "lower"},
+    "ICU-04-03": {"name": "APACHEⅡ评分<10分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04-04": {"name": "10≤APACHEⅡ评分<15分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04-05": {"name": "15≤APACHEⅡ评分<20分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04-06": {"name": "20≤APACHEⅡ评分<25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
+    "ICU-04-07": {"name": "APACHEⅡ评分≥25分患者总数", "unit": "人", "good": (0, 999999), "warn": (0, 999999), "dir": "range"},
     "ICU-05-1h": {"name": "感染性休克1h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-05-3h": {"name": "感染性休克3h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-05-6h": {"name": "感染性休克6h Bundle完成率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
@@ -586,21 +609,21 @@ SOURCE_DESC = {
     "ICU-01": {"numerator": "实际占用床位数累计之和", "denominator": "实际开放床位数累计之和"},
     "ICU-02": {"numerator": "ICU在岗执业医师总人数", "denominator": "实际开放床位数总和"},
     "ICU-03": {"numerator": "ICU在岗执业护士总人数", "denominator": "实际开放床位数总和"},
-    "ICU-04": {"numerator": "首次APACHEⅡ评分≥15分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04F": {"numerator": "首次APACHEⅡ评分<15分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04A": {"numerator": "首次APACHEⅡ评分<10分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04B": {"numerator": "首次APACHEⅡ评分10～14分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04C": {"numerator": "首次APACHEⅡ评分15～19分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04D": {"numerator": "首次APACHEⅡ评分20～24分的患者数", "denominator": "同期入住ICU的患者总人数"},
-    "ICU-04E": {"numerator": "首次APACHEⅡ评分≥25分的患者数", "denominator": "同期入住ICU的患者总人数"},
+    "ICU-04-01": {"numerator": "本次住院首次APACHEⅡ评分≥15分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-02": {"numerator": "本次住院首次APACHEⅡ评分<15分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-03": {"numerator": "本次住院首次APACHEⅡ评分<10分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-04": {"numerator": "本次住院首次APACHEⅡ评分10～14分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-05": {"numerator": "本次住院首次APACHEⅡ评分15～19分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-06": {"numerator": "本次住院首次APACHEⅡ评分20～24分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-07": {"numerator": "本次住院首次APACHEⅡ评分≥25分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-05-1h": {"numerator": "1h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-3h": {"numerator": "3h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-6h": {"numerator": "6h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-06": {"numerator": "首剂抗菌药前完成病原学送检(培养/镜检/免疫/分子)的患者数", "denominator": "以治疗为目的使用抗菌药的患者数(已剔除围术期/短疗程预防)"},
-    "ICU-07": {"numerator": "实施物理或药物DVT预防措施的患者数", "denominator": "同期入住ICU的所有患者数"},
+    "ICU-07": {"numerator": "本次住院期间实施物理或药物DVT预防措施的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-08": {"numerator": "实施俯卧位通气治疗的患者数", "denominator": "满足PEEP≥5且P/F<150的ARDS患者数"},
-    "ICU-09": {"numerator": "进行镇痛评分(NRS/CPOT/BPS)测定的患者数", "denominator": "同期入住ICU的所有患者数"},
-    "ICU-10": {"numerator": "进行镇静评分(RASS/SAS)测定的患者数", "denominator": "同期入住ICU的所有患者数"},
+    "ICU-09": {"numerator": "本次住院期间进行镇痛评分(NRS/CPOT/BPS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-10": {"numerator": "本次住院期间进行镇静评分(RASS/SAS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-11": {"numerator": "实际死亡患者总数", "denominator": "预计死亡概率(SMR公式计算)累计总和"},
     "ICU-12": {"numerator": "非计划自行拔除气管导管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
     "ICU-13": {"numerator": "气管插管拔除后48小时内重新插管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
@@ -616,7 +639,7 @@ SOURCE_DESC = {
 # 基础Mock数据产生器
 def get_mock_base_values():
     return {
-        "ICU-01": 82.3, "ICU-02": 0.9, "ICU-03": 2.8, "ICU-04": 58.2,
+        "ICU-01": 82.3, "ICU-02": 0.9, "ICU-03": 2.8, "ICU-04-01": 58.2,
         "ICU-05-1h": 88.0, "ICU-05-3h": 76.0, "ICU-05-6h": 65.0, "ICU-06": 93.5,
         "ICU-07": 87.1, "ICU-08": 72.4, "ICU-09": 95.2, "ICU-10": 91.8,
         "ICU-11": 0.92, "ICU-12": 3.2, "ICU-13": 4.1, "ICU-14": 6.8,
@@ -672,7 +695,7 @@ def _summary_row_to_api(r: dict) -> dict:
 
 
 def _calc_value(code: str, numerator: float, denominator: float) -> float:
-    if code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E"):
+    if code in ("ICU-04-03", "ICU-04-04", "ICU-04-05", "ICU-04-06", "ICU-04-07"):
         # APACHE 分段：值 = 该段患者人数
         return float(numerator or 0)
     if denominator <= 0:
@@ -863,7 +886,7 @@ def query_summary(period: str, icu_unit: str = "all"):
     for dc in dept_codes:
         icu02_den += get_open_bed_count(dc, start_date, end_date)
 
-    # ----- ICU-04 分子分母：从 score 表取真实 APACHEⅡ 数据 -----
+    # ----- ICU-04-01 分子分母：从 score 表取真实 APACHEⅡ 数据 -----
     icu04_data = get_icu04_apache_data(dept_codes, start_date, end_date)
     icu04_num = icu04_data["num_count"]
     icu04_den = icu04_data["den_count"]
@@ -929,10 +952,10 @@ def query_summary(period: str, icu_unit: str = "all"):
 
     # ----- ICU-07：DVT预防率（DataCenter.VI_ICU_ZYYZ 医嘱包含匹配）-----
     dvt_data = get_dvt_prevention_patients(dept_codes, start_date, end_date)
-    # 人数口径（INDICATORS_CONFIG 定义分子分母均为“患者数”）：
-    # 分子=实施预防的患者数 all_count，分母=同期在科患者数 icu04_den（均按 mrn 去重）
+    # 人次口径：分子=本次住院窗口内实施预防的在科人次 all_count，
+    # 分母=同期在科记录数 icu04_den（同队列，均不按 mrn 去重）
     icu07_num = dvt_data.get("all_count", 0)
-    icu07_den = icu04_den  # 分母=同期在科患者（同ICU-04，共用 get_icu_denominator_stays）
+    icu07_den = icu04_den  # 分母=同期在科记录（同ICU-04-01，共用 get_icu_denominator_stays）
 
     # ----- ICU-08：ARDS俯卧位实施率（三闸门分母 + 俯卧位分子）-----
     icu08_data = get_icu08_data(dept_codes, start_date, end_date)
@@ -950,7 +973,7 @@ def query_summary(period: str, icu_unit: str = "all"):
         "ICU-01": {"num": icu01_num, "den": icu01_den},
         "ICU-02": {"num": icu02_num, "den": icu02_den},
         "ICU-03": {"num": icu03_num, "den": icu02_den},
-        "ICU-04": {"num": icu04_num, "den": icu04_den},
+        "ICU-04-01": {"num": icu04_num, "den": icu04_den},
         "ICU-05-1h": {"num": bun_1h, "den": bun_den},
         "ICU-05-3h": {"num": bun_3h, "den": bun_den},
         "ICU-05-6h": {"num": bun_6h, "den": bun_den},
@@ -1094,6 +1117,17 @@ def _enrich_admission_discharge(items, dept_codes):
         it["discharge_type"] = info.get("discharge_type", "")
     return items
 
+def _score_cell(v):
+    """APACHEⅡ 展示值：9.0→9、13.5→13.5，None/'' 透传（前端显示 —）。"""
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    return int(f) if f.is_integer() else round(f, 1)
+
+
 def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     """
     第三级：明细数据。
@@ -1108,8 +1142,12 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     end_date = f"{year}-{month}-{end_day:02d}"
 
     from datetime import datetime as dt, timedelta
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    # 入口一次性转 UTC 帧：下游 Mongo 查询/比较自动同帧
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_end_wide(end_date)  # 北京末日 23:59:59 → UTC 15:59:59，禁止再重组
+    # 日历天数算术用北京墙钟日期（存储 naive=UTC，勿从 UTC 帧取 y/m/d）
+    start_day = dt.fromisoformat(start_date).date()
+    end_day_d = dt.fromisoformat(end_date).date()
     dept_codes = _resolve_dept_codes(icu_unit)
 
     # ---- ICU-01 分母：床位数 × 天数（汇总，不列明细床位） ----
@@ -1143,6 +1181,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     # ---- ICU-00：患者动态明细 ----
     if code == "ICU-00":
         from db import get_patient_census_detail as _census_detail
+        # part 已由 _detail_cache_payload 映射为 census 口径（carry_in/total/...），
+        # db 层返回的入出科时间已是 fmt_bj 北京帧字符串，此处禁止再 fmt（会双 +8h）
         items = _census_detail(dept_codes, start_date, end_date, part)
         items = [{
             "patient_id": p.get("patient_id", ""),
@@ -1151,8 +1191,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             "age": "",
             "bed_no": p.get("hisBed", ""),
             "dept": "",
-            "admit_time": str(p.get("icuAdmissionTime", ""))[:16],
-            "discharge_time": str(p.get("icuDischargeTime", ""))[:16],
+            "admit_time": p.get("icuAdmissionTime", ""),
+            "discharge_time": p.get("icuDischargeTime", ""),
             "admission_source": "",
             "value": 1,
             "detail_id": p.get("patient_id", ""),
@@ -1176,7 +1216,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "gender": "", "age": "",
                     "bed_no": f"俯卧{p.get('prone_count',0)}次",
                     "dept": "",
-                    "admit_time": str(p.get("prone_times", [""])[0])[:16] if p.get("prone_times") else "",
+                    "admit_time": fmt_bj(p.get("prone_times", [""])[0]) if p.get("prone_times") else "",
                     "discharge_time": "",
                     "admission_source": "",
                     "value": p.get("prone_count", 0),
@@ -1209,7 +1249,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "bed_no": f"P/F={p.get('pf_ratio','?')}  PEEP={p.get('peep','?')}",
                     "dept": "",
                     "admit_time": f"纳入: {p.get('arm','')}  |  氧疗途径: {p.get('o2_route','?')}{flow_s}",
-                    "discharge_time": str(p.get("pf_time", ""))[:16] if p.get("pf_time") else "",
+                    "discharge_time": fmt_bj(p.get("pf_time")),
                     "admission_source": "",
                     "value": round(p.get('pf_ratio', 0), 1) if isinstance(p.get('pf_ratio'), (int, float)) else p.get('pf_ratio', 0),
                     "exclusion_key": p.get("exclusion_key", ""),
@@ -1228,72 +1268,87 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             _enrich_admission_discharge(items, dept_codes)
             return items
 
-    # ---- ICU-04：从 score 表取 APACHEⅡ 明细 ----
-    if code == "ICU-04":
+    # ---- ICU-04-01：从 score 表取 APACHEⅡ 明细 ----
+    if code == "ICU-04-01":
         data = get_icu04_apache_data(dept_codes, start_date, end_date)
+        # 在科记录_id → 原始 stay（分子行只有评分信息，患者类型/出科要回查分母队列）
+        stay_map = {str(p.get("_id", "")): p for p in data.get("den_patients", [])}
+        score_map = data.get("score_map") or {}
         if part == "numerator":
-            # 返回首次 APACHEⅡ ≥ 15 的患者
+            # 返回本次住院首次 APACHEⅡ ≥ 15 的在科记录（人次口径）
             items = []
             for p in data.get("num_patients", []):
+                s = stay_map.get(str(p.get("_id", "")), {})
                 items.append({
                     "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                    "detail_id": str(p.get("_id", "")),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", "-"),
                     "gender": "",
                     "age": "",
                     "bed_no": p.get("hisBed", ""),
                     "dept": "",
-                    "admit_time": p.get("score_time").strftime("%Y-%m-%d %H:%M") if p.get("score_time") else "-",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(p.get("score_time"), default="-"),
+                    "discharge_time": fmt_bj(s.get("icuDischargeTime")),
                     "admission_source": "",
-                    "value": p.get("score", 0),
+                    "patient_type": "原有" if s.get("icuAdmissionTime", end_dt) < start_dt else "新入",
+                    "value": _score_cell(p.get("score", 0)),
                 })
             _enrich_admission_discharge(items, dept_codes)
             return items
         else:
-            # 分母：所有在科患者
+            # 分母：所有在科记录（人次口径），eval_status 标 未评/已评
             items = []
             for p in data.get("den_patients", []):
                 items.append({
                     "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                    "detail_id": str(p.get("_id", "")),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", "-"),
                     "gender": "",
                     "age": "",
                     "bed_no": p.get("hisBed", ""),
                     "dept": "",
-                    "admit_time": p.get("icuAdmissionTime").strftime("%Y-%m-%d %H:%M") if p.get("icuAdmissionTime") else "-",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(p.get("icuAdmissionTime"), default="-"),
+                    "discharge_time": fmt_bj(p.get("icuDischargeTime")),
                     "admission_source": "",
                     "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
-                    "value": 1,
+                    "eval_status": "已评" if str(p.get("_id", "")) in score_map else "未评",
+                    # 首次 APACHEⅡ 分值（未评 → None，前端显示 —），便于核对
+                    # 「分子(≥15) + ICU-04-02分子(<15) + 未评 = 分母」
+                    "value": _score_cell(score_map.get(str(p.get("_id", "")))),
                 })
             _enrich_admission_discharge(items, dept_codes)
             return items
 
-    # ---- ICU-04A～E / ICU-04F：APACHEⅡ 分段明细 ----
-    if code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E", "ICU-04F"):
+    # ---- ICU-04-03～E / ICU-04-02：APACHEⅡ 分段明细 ----
+    if code in ("ICU-04-03", "ICU-04-04", "ICU-04-05", "ICU-04-06", "ICU-04-07", "ICU-04-02"):
         from db import get_apache_score_bands
         data = get_apache_score_bands(dept_codes, start_date, end_date)
+        stay_map = {str(p.get("_id", "")): p for p in data.get("den_patients", [])}
+        score_map = data.get("score_map") or {}
         if part == "numerator":
-            if code == "ICU-04F":
+            if code == "ICU-04-02":
                 band_rows = (data.get("bands") or {}).get("lt10", []) + \
                             (data.get("bands") or {}).get("10_15", [])
             else:
-                band_key = {"ICU-04A": "lt10", "ICU-04B": "10_15", "ICU-04C": "15_20",
-                            "ICU-04D": "20_25", "ICU-04E": "ge25"}[code]
+                band_key = {"ICU-04-03": "lt10", "ICU-04-04": "10_15", "ICU-04-05": "15_20",
+                            "ICU-04-06": "20_25", "ICU-04-07": "ge25"}[code]
                 band_rows = (data.get("bands") or {}).get(band_key, [])
             items = []
             for p in band_rows:
+                s = stay_map.get(str(p.get("_id", "")), {})
                 items.append({
                     "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                    "detail_id": str(p.get("_id", "")),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", "-"),
                     "gender": "",
                     "age": "",
                     "bed_no": p.get("hisBed", ""),
                     "dept": "",
-                    "admit_time": p.get("score_time").strftime("%Y-%m-%d %H:%M") if p.get("score_time") else "-",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(p.get("score_time"), default="-"),
+                    "discharge_time": fmt_bj(s.get("icuDischargeTime")),
                     "admission_source": "",
-                    "value": p.get("score", 0),
+                    "patient_type": "原有" if s.get("icuAdmissionTime", end_dt) < start_dt else "新入",
+                    "value": _score_cell(p.get("score", 0)),
                 })
             _enrich_admission_discharge(items, dept_codes)
             return items
@@ -1301,16 +1356,19 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         for p in data.get("den_patients", []):
             items.append({
                 "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patientId") or str(p.get("_id", "-"))[-8:],
+                "detail_id": str(p.get("_id", "")),   # 在科记录 _id，多次入科可区分
                 "name": p.get("name", "-"),
                 "gender": "",
                 "age": "",
                 "bed_no": p.get("hisBed", ""),
                 "dept": "",
-                "admit_time": p.get("icuAdmissionTime").strftime("%Y-%m-%d %H:%M") if p.get("icuAdmissionTime") else "-",
-                "discharge_time": "",
+                "admit_time": fmt_bj(p.get("icuAdmissionTime"), default="-"),
+                "discharge_time": fmt_bj(p.get("icuDischargeTime")),
                 "admission_source": "",
                 "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
-                "value": 1,
+                "eval_status": "已评" if str(p.get("_id", "")) in score_map else "未评",
+                # 首次 APACHEⅡ 分值（未评 → None，前端显示 —）
+                "value": _score_cell(score_map.get(str(p.get("_id", "")))),
             })
         _enrich_admission_discharge(items, dept_codes)
         return items
@@ -1393,8 +1451,10 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             for lac in lac_all:
                 item = dict(lac)
                 st = item.get("sample_time", "")
+                # db.py 乳酸 sample_time 已输出北京串（字符串直通防 +16）；
+                # datetime 实例（旧缓存/旁路）才 +8 转北京
                 if hasattr(st, 'isoformat'):
-                    item["sample_time"] = st.isoformat()[:19]
+                    item["sample_time"] = fmt_bj(st, "%Y-%m-%dT%H:%M:%S")
                 lactate_all_serialized.append(item)
 
             # 原因（#修复: 引擎产出 bundle_xh.reasons 数组，此前读 reason/reason_codes 恒为空）
@@ -1404,7 +1464,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             primary_reason = gate_reason or (bundle_reasons[0] if bundle_reasons else "")
 
             return {
-                "t0": str(v3.get("t0", ""))[:16] if v3.get("t0") else "",
+                "t0": fmt_bj(v3.get("t0")),
                 "finish": v3.get("finish"),
                 # 三步判定（P3 时间线用）: None=数据缺失 / False=未达标 / True=达标
                 "step1": v3.get("step1"),
@@ -1420,32 +1480,32 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "s1": v3.get("s1"), "s2": v3.get("s2"), "s3": v3.get("s3"), "s4": v3.get("s4"),
                 # 乳酸
                 "lactate": v3.get("lactate_initial"),
-                "lactate_time": str(v3.get("lactate_initial_time", ""))[:16] if v3.get("lactate_initial_time") else "",
+                "lactate_time": fmt_bj(v3.get("lactate_initial_time")),
                 "lactate_max": v3.get("lactate_max"),
                 "lactate_recheck": v3.get("lactate_recheck_value"),
-                "lactate_recheck_time": str(v3.get("lactate_recheck_time", ""))[:16] if v3.get("lactate_recheck_time") else "",
+                "lactate_recheck_time": fmt_bj(v3.get("lactate_recheck_time")),
                 "lactate_all": lactate_all_serialized,
                 # MAP
                 "map": v3.get("map_min"),
-                "map_time": str(v3.get("map_time", ""))[:16] if v3.get("map_time") else "",
+                "map_time": fmt_bj(v3.get("map_time")),
                 # GCS
                 "gcs": v3.get("gcs_min"),
-                "gcs_time": str(v3.get("gcs_time", ""))[:16] if v3.get("gcs_time") else "",
+                "gcs_time": fmt_bj(v3.get("gcs_time")),
                 # P/F
                 "pf_ratio": v3.get("pf_ratio_min"),
-                "pf_ratio_time": str(v3.get("pf_ratio_time", ""))[:16] if v3.get("pf_ratio_time") else "",
+                "pf_ratio_time": fmt_bj(v3.get("pf_ratio_time")),
                 # 抗生素
-                "antibiotic_time": str(v3.get("antibiotic_time", ""))[:16] if v3.get("antibiotic_time") else "",
+                "antibiotic_time": fmt_bj(v3.get("antibiotic_time")),
                 "antibiotic_name": v3.get("antibiotic_name", ""),
                 # 血培养
-                "culture_time": str(v3.get("culture_time", ""))[:16] if v3.get("culture_time") else "",
+                "culture_time": fmt_bj(v3.get("culture_time")),
                 "culture_name": v3.get("culture_name", ""),
                 # 液体
                 "fluid_ml": v3.get("fluid_3h_ml", 0),
                 "has_fluid_1h": v3.get("has_fluid_1h"),
                 # 血管活性药
                 "vaso_name": v3.get("vaso_name", ""),
-                "vaso_start_time": str(v3.get("vaso_start_time", ""))[:16] if v3.get("vaso_start_time") else "",
+                "vaso_start_time": fmt_bj(v3.get("vaso_start_time")),
                 # 原因
                 "reason": primary_reason,
                 "reason_codes": bundle_reasons or ([gate_reason] if gate_reason else []),
@@ -1488,11 +1548,11 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "exclusion_key": p.get("exclusion_key", ""),
                     "patient_id": mrn, "name": p.get("name", ""),
                     "gender": "", "age": "", "bed_no": p.get("hisBed", ""), "dept": "",
-                    "admit_time": str(v3.get("t0", ""))[:16] if v3.get("t0") else "",
+                    "admit_time": fmt_bj(v3.get("t0")),
                     "discharge_time": "", "admission_source": "",
                     "admission_type": admission_type,
                     "value": 1,
-                    "t0": str(v3.get("t0", ""))[:16] if v3.get("t0") else "",
+                    "t0": fmt_bj(v3.get("t0")),
                     "diagnose": p.get("diagnose", ""),
                     "sc_pid": p.get("sc_pid", ""),
                     "v3": _build_v3_dict(v3, hour),
@@ -1535,11 +1595,11 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "exclusion_key": d.get("exclusion_key", ""),
                     "patient_id": mrn, "name": d.get("name", ""),
                     "gender": "", "age": "", "bed_no": "", "dept": "",
-                    "admit_time": str(d.get("diagnosisTime", ""))[:16] if d.get("diagnosisTime") else "",
+                    "admit_time": fmt_bj(d.get("diagnosisTime")),
                     "discharge_time": "", "admission_source": "",
                     "admission_type": admission_type,
                     "value": 1,
-                    "t0": str(v3.get("t0", ""))[:16] if v3.get("t0") else "",
+                    "t0": fmt_bj(v3.get("t0")),
                     "diagnose": d.get("diagnose", ""),
                     "sc_pid": d.get("sc_pid", ""),
                     "v3": _build_v3_dict(v3, hour),
@@ -1568,7 +1628,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "gender": "", "age": "",
                     "bed_no": p.get("test_name", "")[:60] or p.get("test_source", ""),
                     "dept": "",
-                    "admit_time": tt.strftime("%Y-%m-%d %H:%M") if hasattr(tt, 'strftime') else str(tt)[:16] if tt else "",
+                    "admit_time": fmt_bj(tt),
                     "discharge_time": "",
                     "admission_source": "",
                     "value": 1,
@@ -1590,7 +1650,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     drug_display = f"{drug} [{purpose}]"
                 else:
                     drug_display = f"{drug} [{purpose}·{decided_by}]"
-                abx_time_str = at.strftime("%m/%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else ""
+                abx_time_str = fmt_bj(at, "%m/%d %H:%M")
                 # 低置信度标记: AI 置信度<0.6 或 fallback 或 need_review
                 is_low_conf = (
                     need_review
@@ -1614,19 +1674,26 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     # ---- ICU-09：镇痛评估率明细 ----
     if code == "ICU-09":
         data = get_icu09_data(dept_codes, start_date, end_date)
+        # 分母行带 icu_admit/icu_discharge：分子行按 pid 回查，补 患者类型/出科时间
+        den_map = {p.get("pid", ""): p for p in data.get("den_patients", [])}
+        num_ids = {p.get("pid", "") for p in data.get("num_patients", [])}
         if part == "numerator":
             items = []
             for p in data.get("num_patients", []):
                 at = p.get("assess_time")
+                s = den_map.get(p.get("pid", ""), {})
+                sa = s.get("icu_admit")
                 items.append({
                     "patient_id": p.get("patient_id", p.get("mrn", "")),
+                    "detail_id": p.get("pid", ""),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", ""),
                     "gender": "", "age": "",
                     "bed_no": p.get("assess_source", ""),
                     "dept": p.get("assess_scale", ""),
-                    "admit_time": at.strftime("%Y-%m-%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else "",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(at),
+                    "discharge_time": fmt_bj(s.get("icu_discharge")),
                     "admission_source": "",
+                    "patient_type": "原有" if sa and sa < start_dt else "新入",
                     "value": p.get("assess_value", ""),
                 })
             _enrich_admission_discharge(items, dept_codes)
@@ -1637,13 +1704,15 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 at = p.get("icu_admit")
                 items.append({
                     "patient_id": p.get("patient_id", p.get("mrn", "")),
+                    "detail_id": p.get("pid", ""),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", ""),
                     "gender": "", "age": "",
                     "bed_no": p.get("hisBed", ""),
                     "dept": "",
-                    "admit_time": at.strftime("%Y-%m-%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else "",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(at),
+                    "discharge_time": fmt_bj(p.get("icu_discharge")),
                     "patient_type": "原有" if at and at < start_dt else "新入",
+                    "eval_status": "已评" if p.get("pid", "") in num_ids else "未评",
                     "admission_source": "",
                     "value": 1,
                 })
@@ -1653,19 +1722,26 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     # ---- ICU-10：镇静评估率明细 ----
     if code == "ICU-10":
         data = get_icu10_data(dept_codes, start_date, end_date)
+        # 分母行带 icu_admit/icu_discharge：分子行按 pid 回查，补 患者类型/出科时间
+        den_map = {p.get("pid", ""): p for p in data.get("den_patients", [])}
+        num_ids = {p.get("pid", "") for p in data.get("num_patients", [])}
         if part == "numerator":
             items = []
             for p in data.get("num_patients", []):
                 at = p.get("assess_time")
+                s = den_map.get(p.get("pid", ""), {})
+                sa = s.get("icu_admit")
                 items.append({
                     "patient_id": p.get("patient_id", p.get("mrn", "")),
+                    "detail_id": p.get("pid", ""),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", ""),
                     "gender": "", "age": "",
                     "bed_no": p.get("assess_source", ""),
                     "dept": p.get("assess_scale", ""),
-                    "admit_time": at.strftime("%Y-%m-%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else "",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(at),
+                    "discharge_time": fmt_bj(s.get("icu_discharge")),
                     "admission_source": "",
+                    "patient_type": "原有" if sa and sa < start_dt else "新入",
                     "value": p.get("assess_value", ""),
                 })
             _enrich_admission_discharge(items, dept_codes)
@@ -1676,14 +1752,16 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 at = p.get("icu_admit")
                 items.append({
                     "patient_id": p.get("patient_id", p.get("mrn", "")),
+                    "detail_id": p.get("pid", ""),   # 在科记录 _id，多次入科可区分
                     "name": p.get("name", ""),
                     "gender": "", "age": "",
                     "bed_no": p.get("hisBed", ""),
                     "dept": "",
-                    "admit_time": at.strftime("%Y-%m-%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else "",
-                    "discharge_time": "",
+                    "admit_time": fmt_bj(at),
+                    "discharge_time": fmt_bj(p.get("icu_discharge")),
                     "admission_source": "",
                     "patient_type": "原有" if at and at < start_dt else "新入",
+                    "eval_status": "已评" if p.get("pid", "") in num_ids else "未评",
                     "value": 1,
                 })
             _enrich_admission_discharge(items, dept_codes)
@@ -1704,8 +1782,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "gender": "", "age": "",
                 "bed_no": p.get("dischargedType", ""),
                 "dept": p.get("dept_code", ""),
-                "admit_time": at.strftime("%Y-%m-%d %H:%M") if hasattr(at, 'strftime') else str(at)[:16] if at else "",
-                "discharge_time": dt_out.strftime("%Y-%m-%d %H:%M") if hasattr(dt_out, 'strftime') else str(dt_out)[:16] if dt_out else "",
+                "admit_time": fmt_bj(at),
+                "discharge_time": fmt_bj(dt_out),
                 "admission_source": "",
                 "value": round(cal_dead, 4) if isinstance(cal_dead, (int, float)) else cal_dead,
             })
@@ -1725,12 +1803,12 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             if code == "ICU-13" and part == "numerator":
                 event = f"{p.get('tube_type', '')} → {p.get('reinsert_type', '')}"
                 time_desc = (
-                    f"拔管 {tube_end.strftime('%Y-%m-%d %H:%M') if hasattr(tube_end, 'strftime') else str(tube_end)[:16]}"
-                    f" / 再置管 {reinsert_start.strftime('%Y-%m-%d %H:%M') if hasattr(reinsert_start, 'strftime') else str(reinsert_start)[:16]}"
+                    f"拔管 {fmt_bj(tube_end)}"
+                    f" / 再置管 {fmt_bj(reinsert_start)}"
                 )
             else:
                 event = p.get("tube_type", "")
-                time_desc = tube_end.strftime("%Y-%m-%d %H:%M") if hasattr(tube_end, 'strftime') else str(tube_end)[:16] if tube_end else ""
+                time_desc = fmt_bj(tube_end)
             items.append({
                 "detail_id": p.get("tube_id", ""),
                 "patient_id": p.get("patient_id", p.get("mrn", "")),
@@ -1739,14 +1817,14 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "bed_no": event,
                 "dept": p.get("dept_code", ""),
                 "admit_time": time_desc,
-                "discharge_time": tube_start.strftime("%Y-%m-%d %H:%M") if hasattr(tube_start, 'strftime') else str(tube_start)[:16] if tube_start else "",
+                "discharge_time": fmt_bj(tube_start),
                 "admission_source": "",
                 "tube_type": p.get("tube_type", ""),
-                "tube_start": tube_start.strftime("%Y-%m-%d %H:%M") if hasattr(tube_start, 'strftime') else str(tube_start)[:16] if tube_start else "",
-                "tube_end": tube_end.strftime("%Y-%m-%d %H:%M") if hasattr(tube_end, 'strftime') else str(tube_end)[:16] if tube_end else "",
+                "tube_start": fmt_bj(tube_start),
+                "tube_end": fmt_bj(tube_end),
                 "unplanned": p.get("unplanned", False),
                 "reinsert_type": p.get("reinsert_type", ""),
-                "reinsert_start": reinsert_start.strftime("%Y-%m-%d %H:%M") if hasattr(reinsert_start, 'strftime') else str(reinsert_start)[:16] if reinsert_start else "",
+                "reinsert_start": fmt_bj(reinsert_start),
                 "value": 1,
             })
         _enrich_admission_discharge(items, dept_codes)
@@ -1771,13 +1849,13 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "gender": "", "age": "",
                 "bed_no": p.get("admissionType", ""),
                 "dept": p.get("operation_name", ""),
-                "admit_time": icu_admit.strftime("%Y-%m-%d %H:%M") if hasattr(icu_admit, 'strftime') else str(icu_admit)[:16] if icu_admit else "",
+                "admit_time": fmt_bj(icu_admit),
                 "discharge_time": "",
                 "admission_source": p.get("admissionPlan", ""),
                 "admissionType": p.get("admissionType", ""),
                 "admissionPlan": p.get("admissionPlan", ""),
                 "operation_name": p.get("operation_name", ""),
-                "icuAdmissionTime": icu_admit.strftime("%Y-%m-%d %H:%M") if hasattr(icu_admit, 'strftime') else str(icu_admit)[:16] if icu_admit else "",
+                "icuAdmissionTime": fmt_bj(icu_admit),
                 "basis": basis,
                 "value": 1,
             })
@@ -1792,8 +1870,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         for p in src:
             discharge_time = p.get("icu_discharge")
             re_admit = p.get("re_icu_admit")
-            discharge_text = discharge_time.strftime("%Y-%m-%d %H:%M") if hasattr(discharge_time, "strftime") else str(discharge_time)[:16] if discharge_time else ""
-            re_admit_text = re_admit.strftime("%Y-%m-%d %H:%M") if hasattr(re_admit, "strftime") else str(re_admit)[:16] if re_admit else "/"
+            discharge_text = fmt_bj(discharge_time)
+            re_admit_text = fmt_bj(re_admit, default="/")
             source_text = "合并历史" if p.get("source") == "patInIcuHistoryList" else "Patient记录"
             readmit_source = "合并历史" if p.get("re_admit_source") == "patInIcuHistoryList" else ("Patient记录" if p.get("re_admit_source") else "")
             basis = (
@@ -1828,8 +1906,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         for p in src:
             admit_time = p.get("icu_admit")
             assess_time = p.get("first_assess_time")
-            admit_text = admit_time.strftime("%Y-%m-%d %H:%M") if hasattr(admit_time, "strftime") else str(admit_time)[:16] if admit_time else ""
-            assess_text = assess_time.strftime("%Y-%m-%d %H:%M") if hasattr(assess_time, "strftime") else str(assess_time)[:16] if assess_time else "/"
+            admit_text = fmt_bj(admit_time)
+            assess_text = fmt_bj(assess_time, default="/")
             assessed_text = "是" if p.get("assessed") else "否"
             items.append({
                 "detail_id": p.get("pid", ""),
@@ -1868,9 +1946,9 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             admit_time = p.get("icu_admit")
             en_time = p.get("en_start_time")
             discharge_time = p.get("icu_discharge")
-            admit_text = admit_time.strftime("%Y-%m-%d %H:%M") if hasattr(admit_time, "strftime") else str(admit_time)[:16] if admit_time else ""
-            en_text = en_time.strftime("%Y-%m-%d %H:%M") if hasattr(en_time, "strftime") else str(en_time)[:16] if en_time else "/"
-            discharge_text = discharge_time.strftime("%Y-%m-%d %H:%M") if hasattr(discharge_time, "strftime") else str(discharge_time)[:16] if discharge_time else ""
+            admit_text = fmt_bj(admit_time)
+            en_text = fmt_bj(en_time, default="/")
+            discharge_text = fmt_bj(discharge_time)
             contraindication = "、".join(p.get("contraindication_hits", [])) if p.get("contraindication_hits") else ""
             source = p.get("source", "none")
             source_text = source_label.get(source, source)
@@ -1929,11 +2007,11 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "gender": "", "age": "",
                     "bed_no": p.get("diseaseType", ""),
                     "dept": p.get("notes", ""),
-                    "admit_time": dtm.strftime("%Y-%m-%d %H:%M") if hasattr(dtm, 'strftime') else str(dtm)[:16] if dtm else "",
+                    "admit_time": fmt_bj(dtm),
                     "discharge_time": "",
                     "admission_source": p.get("lastEditUserId", ""),
                     "diseaseType": p.get("diseaseType", ""),
-                    "diagnosisTime": dtm.strftime("%Y-%m-%d %H:%M") if hasattr(dtm, 'strftime') else str(dtm)[:16] if dtm else "",
+                    "diagnosisTime": fmt_bj(dtm),
                     "notes": p.get("notes", ""),
                     "basis": p.get("dedup_basis", ""),
                     "value": 1,
@@ -2006,8 +2084,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "device_days": day_count,
                     "tube_points": point_count,
                     "record_time": "",
-                    "tube_start": start_time.strftime("%Y-%m-%d %H:%M") if hasattr(start_time, 'strftime') else str(start_time)[:16] if start_time else "",
-                    "tube_end": end_time.strftime("%Y-%m-%d %H:%M") if hasattr(end_time, 'strftime') else str(end_time)[:16] if end_time else "",
+                    "tube_start": fmt_bj(start_time),
+                    "tube_end": fmt_bj(end_time),
                     "basis": basis_text,
                     "value": day_count,
                 })
@@ -2018,8 +2096,8 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     if code == "ICU-07":
         data = get_dvt_prevention_patients(dept_codes, start_date, end_date)
         if part == "numerator":
-            # 人数口径：num_stays 已按患者去重，行数 == 汇总分子（all_count），
-            # 与分母明细同为一人一行，可逐行核对
+            # 人次口径：num_stays 一行一在科记录，行数 == 汇总分子（all_count），
+            # 与分母明细同为一行一在科记录，可逐行核对
             items = []
             for s in data.get("num_stays", []):
                 orders = s.get("matched_orders", [])
@@ -2036,7 +2114,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "bed_no": s.get("measure", ""),          # 列头「预防措施」
                     "dept": s.get("deptCode", ""),
                     "admit_time": orders[0][:60] if orders else "",   # 列头「医嘱示例」
-                    "discharge_time": _dis.strftime("%Y-%m-%d %H:%M") if _dis else "",
+                    "discharge_time": fmt_bj(_dis),
                     "admission_source": "",
                     "patient_type": "原有" if s.get("icuAdmissionTime") and s.get("icuAdmissionTime") < start_dt else "新入",
                     "value": s.get("order_count", 0),        # 列头「医嘱条数」
@@ -2045,14 +2123,18 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             return items
         else:
             data2 = get_icu04_apache_data(dept_codes, start_date, end_date)
+            # 分母标 预防状态：本次住院窗口内有 DVT 预防医嘱 → 已预防，否则 未预防
+            dvt_num_ids = {str(s.get("stay_id", "")) for s in data.get("num_stays", [])}
             items = [{"patient_id": p.get("mrn", "") or p.get("patientId", ""),
                       "detail_id": str(p.get("_id", ""))[-8:],
                       "mrn": p.get("mrn", ""),
                       "name": p.get("name", ""),
                       "gender": "", "age": "", "bed_no": p.get("hisBed", ""), "dept": p.get("deptCode", ""),
-                      "admit_time": p.get("icuAdmissionTime").strftime("%Y-%m-%d %H:%M") if p.get("icuAdmissionTime") else "-",
-                      "discharge_time": p.get("icuDischargeTime").strftime("%Y-%m-%d %H:%M") if p.get("icuDischargeTime") else "",
-                      "admission_source": "", "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入", "value": 1}
+                      "admit_time": fmt_bj(p.get("icuAdmissionTime"), default="-"),
+                      "discharge_time": fmt_bj(p.get("icuDischargeTime")),
+                      "admission_source": "", "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
+                      "eval_status": "已预防" if str(p.get("_id", "")) in dvt_num_ids else "未预防",
+                      "value": 1}
                      for p in data2.get("den_patients", [])]
             _enrich_admission_discharge(items, dept_codes)
             return items
@@ -2087,7 +2169,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                                 "age": "",
                                 "bed_no": PROFESSION_CN.get(d.get("profession", ""), d.get("profession", "")),
                                 "dept": d.get("departmentCode", ""),
-                                "admit_time": d.get("entryTime").strftime("%Y-%m-%d") if d.get("entryTime") else "-",
+                                "admit_time": fmt_bj(d.get("entryTime"), "%Y-%m-%d", default="-"),
                                 "discharge_time": "",
                                 "admission_source": d.get("educationLevel", ""),
                                 "value": 1,
@@ -2123,7 +2205,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             query = {
                 "deptCode": {"$in": dept_codes},
                 "status": {"$ne": "invalid"},
-                "icuAdmissionTime": {"$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)},
+                "icuAdmissionTime": {"$lte": end_dt},  # 已是宽末日（北京末日 23:59:59 UTC）
                 "$or": [
                     {"icuDischargeTime": {"$gte": start_dt}},
                     {"icuDischargeTime": None},
@@ -2153,16 +2235,17 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     discharge_dt = d.get("icuDischargeTime")
                     mrn = d.get("mrn") or d.get("hisPid") or "-"
 
-                    # ICU-01 分子：计算每位患者的在床天数
+                    # ICU-01 分子：计算每位患者的在床天数（北京墙钟日切，
+                    # 存储帧 naive=UTC → +8 后取日期）
                     if code == "ICU-01" and part == "numerator" and admit_dt:
-                        first_midnight = dt(admit_dt.year, admit_dt.month, admit_dt.day) + timedelta(days=1)
+                        first_md = to_bj_naive(admit_dt).date() + timedelta(days=1)
                         if discharge_dt:
-                            last_midnight = dt(discharge_dt.year, discharge_dt.month, discharge_dt.day)
+                            last_md = to_bj_naive(discharge_dt).date()
                         else:
-                            last_midnight = end_dt
-                        first = max(first_midnight, start_dt)
-                        last = min(last_midnight, end_dt)
-                        bed_days = max(0, (last - first).days + 1) if first <= last else 0
+                            last_md = end_day_d
+                        first = max(first_md, start_day)
+                        last = min(last_md, end_day_d)
+                        bed_days = (last - first).days + 1 if first <= last else 0
                     else:
                         bed_days = d.get("status", "-")
 
@@ -2803,7 +2886,7 @@ def indicator_list(period: str, icu_unit: str = "all", end_period: str = "", noc
         for code, v in agg.items():
             if v["num"] is None or v["den"] is None:
                 val = None
-            elif code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E"):
+            elif code in ("ICU-04-03", "ICU-04-04", "ICU-04-05", "ICU-04-06", "ICU-04-07"):
                 val = float(v["num"] or 0)  # APACHE 分段：值=人数
             elif code == "ICU-11":
                 val = round(v["num"] / v["den"], 2) if v["den"] > 0 else 0
@@ -3060,22 +3143,26 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
     elif code == "ICU-03":
         source_desc = "分子：来自 account 表，筛选 valid 护士（护士长/护理组长/护士/规培/进修/实习护士）" if part == "numerator" \
             else "分母：来自 configBed 表，统计科室实际开放床位数"
-    elif code == "ICU-04":
-        source_desc = "分子：来自 score 表，当月首次 APACHEⅡ 评分 total ≥ 15 的患者" if part == "numerator" \
-            else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人数口径 —— 按住院号去重，同一患者当月多次入科只算一人"
-    elif code in ("ICU-04A", "ICU-04B", "ICU-04C", "ICU-04D", "ICU-04E", "ICU-04F"):
+    elif code == "ICU-04-01":
+        source_desc = ("分子：来自 score 表，本次住院窗口内首次 APACHEⅡ 评分 total ≥ 15 的在科人次"
+                       "（含入科在上月的原有患者，出科后 24h 内补录的评分也计入）") if part == "numerator" \
+            else ("分母：来自 patient 表，统计期内在科记录（排除 invalid）。人次口径 —— 一条在科记录一人次，"
+                  "不按住院号去重。评估状态列：未评 = 本次住院无有效评分；已评中首次评分 <15 者计入 ICU-04-02 分子，"
+                  "故 ICU-04-01分子 + ICU-04-02分子 + 未评 = 分母")
+    elif code in ("ICU-04-03", "ICU-04-04", "ICU-04-05", "ICU-04-06", "ICU-04-07", "ICU-04-02"):
         band_desc = {
-            "ICU-04A": "APACHEⅡ < 10 分",
-            "ICU-04B": "10 ≤ APACHEⅡ < 15 分",
-            "ICU-04C": "15 ≤ APACHEⅡ < 20 分",
-            "ICU-04D": "20 ≤ APACHEⅡ < 25 分",
-            "ICU-04E": "APACHEⅡ ≥ 25 分",
-            "ICU-04F": "APACHEⅡ < 15 分",
+            "ICU-04-03": "APACHEⅡ < 10 分",
+            "ICU-04-04": "10 ≤ APACHEⅡ < 15 分",
+            "ICU-04-05": "15 ≤ APACHEⅡ < 20 分",
+            "ICU-04-06": "20 ≤ APACHEⅡ < 25 分",
+            "ICU-04-07": "APACHEⅡ ≥ 25 分",
+            "ICU-04-02": "APACHEⅡ < 15 分",
         }[code]
         source_desc = (
-            f"分子：来自 score 表，当月首次 APACHEⅡ 评分落入「{band_desc}」的患者（人数口径）"
+            f"分子：来自 score 表，本次住院窗口内首次 APACHEⅡ 评分落入「{band_desc}」的在科人次（人次口径）"
             if part == "numerator"
-            else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人数口径 —— 按住院号去重，与 ICU-04 同队列"
+            else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人次口径 —— 一条在科记录一人次，"
+                 "与 ICU-04-01 同队列；首次评分列显示本次住院首次 APACHEⅡ 分值（未评为 —）"
         )
     elif code in ("ICU-05-1h", "ICU-05-3h", "ICU-05-6h"):
         h = code.split("-")[2]
@@ -3091,17 +3178,18 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         source_desc = (f"分子：来自 VI_ICU_ZYYZ 培养类检验医嘱，首次抗生素前有病原学送检的患者（送检≤首剂时间）" if part == "numerator"
             else f"分母：来自 drugExe 抗菌药执行记录，经三层判定（A感染信号→B围术期→C短疗程→AI灰区）确认治疗目的，已剔除预防性用药")
     elif code == "ICU-07":
-        source_desc = ("分子：来自 DataCenter.VI_ICU_ZYYZ，统计期内已执行的抗凝药或机械预防医嘱"
+        source_desc = ("分子：来自 DataCenter.VI_ICU_ZYYZ，本次住院期间（含入科当月、不只统计月内）"
+                       "已执行的抗凝药或机械预防医嘱"
                        "（按分母队列 mrn 反查 pid，不经 ZYBR 科室过滤；剔除检验假匹配、"
                        "封管/有创压管路维护、血液净化管路抗凝）" if part == "numerator"
-            else "分母：来自 patient 表，统计期内在科患者（deptCode 属本科室、排除 invalid、入出科时间与统计期有交集）。"
-                 "人数口径 —— 按住院号去重，同一患者当月多次入科只算一人，与分子同口径")
+            else "分母：来自 patient 表，统计期内在科记录（deptCode 属本科室、排除 invalid、入出科时间与统计期有交集）。"
+                 "人次口径 —— 一条在科记录一人次，不按住院号去重，与分子同队列")
     elif code == "ICU-09":
-        source_desc = "分子：床旁评估记录或量表评分记录中完成镇痛评分（NRS/CPOT/BPS等）的患者，明细展示评分中文名、分值和时间" if part == "numerator" \
-            else "分母：同期入住ICU的患者总人数（人数口径 —— 按住院号去重，同一患者当月多次入科只算一人）"
+        source_desc = "分子：分母队列中本次住院期间（含入科当月、不只统计月内）有镇痛评分（NRS/CPOT/BPS等）的在科记录，明细展示评分中文名、分值和时间" if part == "numerator" \
+            else "分母：统计期内在科记录（人次口径 —— 一条在科记录一人次，不按住院号去重）"
     elif code == "ICU-10":
-        source_desc = "分子：床旁评估记录或量表评分记录中完成镇静评分（RASS等）的患者，明细展示评分中文名、分值和时间" if part == "numerator" \
-            else "分母：同期入住ICU的患者总人数（人数口径 —— 按住院号去重，同一患者当月多次入科只算一人）"
+        source_desc = "分子：分母队列中本次住院期间（含入科当月、不只统计月内）有镇静评分（RASS等）的在科记录，明细展示评分中文名、分值和时间" if part == "numerator" \
+            else "分母：统计期内在科记录（人次口径 —— 一条在科记录一人次，不按住院号去重）"
     elif code == "ICU-11":
         source_desc = "分子：已结案完整病例中在院死亡或非医嘱离院的患者数" if part == "numerator" \
             else "分母：死亡、出院、非医嘱离院且有入科24小时内首次APACHEⅡ评分病例的预计死亡率之和"
@@ -3118,7 +3206,12 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
             else "分母：同期入住ICU时间超过48小时的患者；EN禁忌证仅标注留痕，不自动剔除"
         )
     elif code == "ICU-00":
-        part_labels = {"carry_in": "原有患者（期初在科）", "new_admit": "新入患者", "discharge": "出科患者"}
+        part_labels = {
+            "numerator": "分子：期初原有患者（入科早于月初、且未在月初前出科）",
+            "denominator": "分母：同期患者总数（原有+新入）— 患者类型列可区分两类",
+            "carry_in": "原有患者（期初在科）", "new_admit": "新入患者",
+            "discharge": "出科患者", "total": "同期患者总数（原有+新入）",
+        }
         source_desc = part_labels.get(part, "患者动态明细")
     else:
         desc_info = SOURCE_DESC.get(code, {"numerator": "分子明细", "denominator": "分母明细"})
@@ -3266,7 +3359,7 @@ def get_bundle_v3_detail(mrn: str, period: str = ""):
                 res = judge_bundle_v3_for_patient(sc_pid, dc_pid, mrn, t0, diag)
                 return {"ok": True, "patient": {
                     "mrn": mrn, "name": p.get("name", ""),
-                    "t0": str(t0) if t0 else None,
+                    "t0": fmt_bj(t0) if t0 else None,
                     "diagnose": diag,
                 }, "v3": res}
             return {"ok": True, "patient": {"mrn": mrn, "name": p.get("name", "")},
@@ -3372,10 +3465,11 @@ def get_patient_sofa(pid: str, eval_time: str = "", event_id: str = ""):
             "sc_pid": sc_pid,
             "mrn": mrn,
             "dc_pid": dc_pid,
-            "t0": t0.isoformat() if t0 else None,
+            # t0 纯展示（不回传）→ 北京 naive 串；eval_time 往返字段 → 保持 UTC 语义、带偏移输出
+            "t0": fmt_bj(t0, "%Y-%m-%dT%H:%M:%S") if t0 else None,
             "t0_status": t0_status,
             "t0_source": t0_source,
-            "eval_time": et.isoformat() if et else None,
+            "eval_time": as_utc(et).isoformat() if et else None,
             "sofa": result,
         }
     except Exception as e:
@@ -3584,7 +3678,7 @@ def tri_tube_warning_confirm(payload: TriTubeConfirmPayload):
     """
     if not payload.user_id:
         return {"ok": False, "error": "user_id required"}
-    diagnosis_time = datetime.fromisoformat(payload.diagnosis_time) if payload.diagnosis_time else datetime.now()
+    diagnosis_time = datetime.fromisoformat(payload.diagnosis_time) if payload.diagnosis_time else datetime.utcnow()
     try:
         doc = confirm_tri_tube_warning(
             pid=payload.pid,

@@ -64,7 +64,9 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
                     get_apache_score_bands)
 
     start, end = _month_bounds(period)
-    start_dt = datetime.fromisoformat(start)
+    # 入科时间存储为真 UTC → 期初边界北京−8h（_is_carry_in 原有/新入判定）
+    from tzutil import utc_day_start
+    start_dt = utc_day_start(start)
     dept_codes = _resolve_dept_codes(icu_unit)
     vals: dict = {k: None for k in REPORT_KEYS}
 
@@ -106,7 +108,7 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
         vals["11.1"], vals["11.2"] = carry, len(persons) - carry
 
         # ---- 2b. APACHEⅡ 分段人数（插在 10.1/10.2 之后）----
-        # 口径与 ICU-04 一致（同队列、人数去重、当月首次 apacheII total），
+        # 口径与 ICU-04-01 一致（同队列、人数去重、当月首次 apacheII total），
         # 仅分值区间不同；无评分的不进桶。
         try:
             bands = get_apache_score_bands(dept_codes, start, end)
@@ -199,9 +201,13 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
             continue
         if not den_rows:
             continue
-        type_map = {p.get("patient_id"): p.get("patient_type") for p in den_rows}
+        # 人次口径：同一患者多次入科会有多行，patient_id 不再唯一，
+        # 用在科记录 detail_id 关联；历史缓存无 detail_id 时退回 patient_id。
+        def _row_key(p):
+            return p.get("detail_id") or p.get("patient_id")
+        type_map = {_row_key(p): p.get("patient_type") for p in den_rows}
         carry = sum(1 for p in num_rows
-                    if type_map.get(p.get("patient_id")) == "原有")
+                    if type_map.get(_row_key(p)) == "原有")
         vals[k1], vals[k2] = carry, len(num_rows) - carry
 
     # ---- 5. ICU-11：37 / 38 / 40.1 / 40.2 ----

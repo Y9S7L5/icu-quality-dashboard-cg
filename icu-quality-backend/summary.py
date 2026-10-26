@@ -32,7 +32,7 @@ from db import (
 # ============================================================
 # 必需指标列表，用于检查月度完整性
 REQUIRED_INDICATORS = frozenset([
-    "ICU-01", "ICU-02", "ICU-03", "ICU-04", "ICU-05",
+    "ICU-01", "ICU-02", "ICU-03", "ICU-04-01", "ICU-05",
     "ICU-06", "ICU-07", "ICU-08", "ICU-09", "ICU-10",
     "ICU-11", "ICU-12", "ICU-13", "ICU-14", "ICU-15",
     "ICU-16", "ICU-17", "ICU-18", "ICU-19", "CAUTI",
@@ -78,7 +78,7 @@ def _compute_icu03(dept_codes, start, end):
 
 
 def _compute_icu04(dept_codes, start, end):
-    """ICU-04: APACHE≥15收治率"""
+    """ICU-04-01: APACHE≥15收治率"""
     d = get_icu04_apache_data(dept_codes, start, end)
     num = min(d["num_count"], d["den_count"])
     den = d["den_count"]
@@ -87,7 +87,7 @@ def _compute_icu04(dept_codes, start, end):
 
 
 def _compute_apache_band(band_key: str):
-    """APACHEⅡ 分段人数（ICU-04A～E）：val = 该段患者数。"""
+    """APACHEⅡ 分段人数（ICU-04-03～E）：val = 该段患者数。"""
     def _fn(dept_codes, start, end):
         d = get_apache_score_bands(dept_codes, start, end)
         num = int(d.get(band_key, 0) or 0)
@@ -98,7 +98,7 @@ def _compute_apache_band(band_key: str):
 
 
 def _compute_icu04_lt15(dept_codes, start, end):
-    """ICU-04F: APACHEⅡ＜15分收治率 = 首次评分<15分人数 / 同期收治患者总数。"""
+    """ICU-04-02: APACHEⅡ＜15分收治率 = 首次评分<15分人数 / 同期收治患者总数。"""
     d = get_apache_score_bands(dept_codes, start, end)
     num = int(d.get("lt10", 0) or 0) + int(d.get("10_15", 0) or 0)
     den = int(d.get("den_count", 0) or 0)
@@ -397,9 +397,9 @@ def _compute_icu06(dept_codes, start, end):
 
 
 def _compute_icu07(dept_codes, start, end):
-    """ICU-07: DVT预防率（人数口径：分子分母均按 mrn 去重）"""
+    """ICU-07: DVT预防率（人次口径：一条在科记录一行，不按 mrn 去重）"""
     d = get_dvt_prevention_patients(dept_codes, start, end)
-    # all_count = 实施预防的患者数；分母 = 同期在科患者数（同为人数口径）
+    # all_count = 实施预防的在科人次；分母 = 同期在科记录数（同为人次口径）
     num = d.get("all_count", 0)
     den = _count_icu_patients(dept_codes, start, end)
     val = round(num / den * 100, 1) if den > 0 else 0.0
@@ -577,15 +577,14 @@ def _compute_cauti(dept_codes, start, end):
 
 def _count_icu_patients(dept_codes, start, end):
     """
-    辅助：统计期内在科患者数 —— **人数口径**，按 mrn 去重。
+    辅助：统计期内在科记录数 —— **人次口径**（一条在科记录一人次，不按 mrn 去重）。
 
-    不能用 get_patient_census(distinct_by="patient")：它的 total = carry_in + new_admit
-    是两个 distinct 集合相加，同一患者「上月带入 + 本月新入」会被数两次。
-    这里直接对与分母明细同一份在科记录去重，保证与 icu04_den 完全一致。
+    与 ICU-04 / ICU-07 / ICU-09 / ICU-10 的分母同口径（均取
+    get_icu_denominator_stays 原始行数），分子也从同一份在科记录出发判定，
+    保证分子分母同队列可逐行对账。
     """
     try:
-        stays = get_icu_denominator_stays(dept_codes, start, end)
-        return len({s.get("mrn") for s in stays if s.get("mrn")})
+        return len(get_icu_denominator_stays(dept_codes, start, end))
     except Exception:
         return 0
 
@@ -615,13 +614,13 @@ INDICATOR_COMPUTERS = {
     "ICU-01": _compute_icu01,
     "ICU-02": _compute_icu02,
     "ICU-03": _compute_icu03,
-    "ICU-04": _compute_icu04,
-    "ICU-04F": _compute_icu04_lt15,
-    "ICU-04A": _compute_apache_band("lt10"),
-    "ICU-04B": _compute_apache_band("10_15"),
-    "ICU-04C": _compute_apache_band("15_20"),
-    "ICU-04D": _compute_apache_band("20_25"),
-    "ICU-04E": _compute_apache_band("ge25"),
+    "ICU-04-01": _compute_icu04,
+    "ICU-04-02": _compute_icu04_lt15,
+    "ICU-04-03": _compute_apache_band("lt10"),
+    "ICU-04-04": _compute_apache_band("10_15"),
+    "ICU-04-05": _compute_apache_band("15_20"),
+    "ICU-04-06": _compute_apache_band("20_25"),
+    "ICU-04-07": _compute_apache_band("ge25"),
     "ICU-05-1h": lambda dc, s, e: _compute_icu05(dc, s, e, "1h"),
     "ICU-05-3h": lambda dc, s, e: _compute_icu05(dc, s, e, "3h"),
     "ICU-05-6h": lambda dc, s, e: _compute_icu05(dc, s, e, "6h"),
@@ -754,8 +753,12 @@ def rebuild_summary(dept_codes: list, periods: list, indicators: list = None,
             for db_name in BED_DB_NAMES:
                 try:
                     db = get_client(db_name)[db_name]
-                    month_start = datetime(int(year), int(month), 1)
-                    next_month_start = month_start + timedelta(days=end_day)
+                    # created_at 存储为真 UTC → 月窗口边界北京−8h（tzutil 入口转换）
+                    from tzutil import utc_day_start
+                    _first = datetime(int(year), int(month), 1)
+                    _next_first = _first + timedelta(days=end_day)  # 日历：下月1号（北京墙钟日期串）
+                    month_start = utc_day_start(_first.strftime("%Y-%m-%d"))
+                    next_month_start = utc_day_start(_next_first.strftime("%Y-%m-%d"))
                     override_count = db.icu_manual_override.count_documents({
                         "created_at": {
                             "$gte": month_start,
@@ -819,7 +822,7 @@ def rebuild_summary(dept_codes: list, periods: list, indicators: list = None,
 
     light_first = {
         "ICU-00": 10, "ICU-01": 10, "ICU-02": 10, "ICU-03": 10,
-        "ICU-04": 20, "ICU-05-1h": 20, "ICU-05-3h": 20, "ICU-05-6h": 20,
+        "ICU-04-01": 20, "ICU-05-1h": 20, "ICU-05-3h": 20, "ICU-05-6h": 20,
         "ICU-07": 20, "ICU-08": 20, "ICU-09": 30, "ICU-10": 30,
         "ICU-12": 30, "ICU-13": 30, "ICU-14": 30, "ICU-15": 30,
         "ICU-16": 30, "ICU-17": 30, "ICU-18": 30,
@@ -861,7 +864,7 @@ def rebuild_summary(dept_codes: list, periods: list, indicators: list = None,
 
 def _natural_months_back(n: int) -> list:
     """自然月递减：从当前月往前推 n 个月，无重复无遗漏。"""
-    now = datetime.utcnow()
+    now = datetime.now()  # 月份标签用北京墙钟（与 main.py 各月份标签口径一致；每月1日0-8点不算上月）
     result = []
     year, month = now.year, now.month
     for _ in range(n):

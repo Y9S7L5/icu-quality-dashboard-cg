@@ -132,13 +132,16 @@
         <p class="tri-basis">{{ columns[columns.length - 1]?.get(p) }}</p>
       </article>
     </div>
-    <!-- ICU-00 患者类型筛选 -->
+    <!-- 同期总数类指标：原有/新入/出科/(未评) 筛选 -->
     <div v-if="hasPatientType && activeData.patients?.length" class="census-filter">
       <span class="filter-label">筛选：</span>
       <button :class="['filter-btn', { active: !patientTypeFilter }]" @click="patientTypeFilter = ''">全部</button>
       <button :class="['filter-btn', { active: patientTypeFilter === '原有' }]" @click="patientTypeFilter = '原有'">原有</button>
       <button :class="['filter-btn', { active: patientTypeFilter === '新入' }]" @click="patientTypeFilter = '新入'">新入</button>
       <button :class="['filter-btn', { active: patientTypeFilter === '出科' }]" @click="patientTypeFilter = '出科'">出科</button>
+      <button v-if="showEvalFilter"
+              :class="['filter-btn', { active: patientTypeFilter === evalFilterLabel }]"
+              @click="patientTypeFilter = evalFilterLabel">{{ evalFilterLabel }}</button>
       <span class="filter-count">共 {{ filteredPatients.length }} 例</span>
     </div>
     <!-- 通用表格（共享列定义） -->
@@ -224,7 +227,7 @@
     </Teleport>
 </template>
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { getDetailColumns, REASON_MAP, GATE_REASONS } from '../utils/detailColumns.js';
 import { exportDetailExcel } from '../utils/exportExcel.js';
 import { addExclusion, removeExclusion } from '../api/index.js';
@@ -345,14 +348,29 @@ const EXCLUSION_SUPPORTED_CODES = ['ICU-08', 'ICU-05-1h', 'ICU-05-3h', 'ICU-05-6
 const canExclude = computed(() => EXCLUSION_SUPPORTED_CODES.includes(props.data?.code));
 const excludedCount = computed(() => (activeData.value?.patients || []).filter(p => p.excluded).length);
 const patientTypeFilter = ref('');
-const hasPatientType = computed(() => ['ICU-00','ICU-04','ICU-07','ICU-09','ICU-10'].includes(activeData.value?.code) && activeData.value?.part === 'denominator');
+// 分母 = 同期ICU患者总数（人次口径）的指标：分子/分母明细都提供 原有/新入/出科/未评 筛选
+const TYPE_FILTER_CODES = ['ICU-00', 'ICU-04-01', 'ICU-04-02', 'ICU-04-03', 'ICU-04-04', 'ICU-04-05', 'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10'];
+const hasPatientType = computed(() => TYPE_FILTER_CODES.includes(activeData.value?.code));
+// 「未评」仅分母维度（ICU-07 是 DVT，标签 未预防；ICU-00 无评估语义）
+const evalFilterLabel = computed(() => activeData.value?.code === 'ICU-07' ? '未预防' : '未评');
+const showEvalFilter = computed(() =>
+  hasPatientType.value && curPart.value === 'denominator' && activeData.value?.code !== 'ICU-00');
+const hasDischarged = (v) => !!v && v !== '/' && v !== '-';
+function matchTypeFilter(p, f) {
+  if (!f) return true;
+  if (f === '出科') return hasDischarged(p.discharge_time);
+  if (f === '未评' || f === '未预防') return p.eval_status === f;
+  return p.patient_type === f;
+}
 const filteredPatients = computed(() => {
   const list = activeData.value?.patients || [];
   return list.filter(p =>
-    (!hasPatientType.value || !patientTypeFilter.value || p.patient_type === patientTypeFilter.value)
+    (!hasPatientType.value || matchTypeFilter(p, patientTypeFilter.value))
     && matchVerdict(p)
     && matchReason(p));
 });
+// 切换指标 / 分子分母时清空类型筛选，避免带着「未评」筛出空分子表
+watch(() => [activeData.value?.code, curPart.value], () => { patientTypeFilter.value = ''; });
 
 const selectedPatientKey = ref(null);
 function handleRowClick(p) {

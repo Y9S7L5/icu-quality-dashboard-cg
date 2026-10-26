@@ -12,6 +12,9 @@ import re
 from dotenv import load_dotenv
 import logging
 
+# 时区统一：存储帧=真 UTC；边界北京→UTC(−8)，展示 UTC→北京(+8)
+from tzutil import as_utc, to_bj_naive, utc_day_start, utc_day_end_wide, fmt_bj  # noqa: F401
+
 logger = logging.getLogger("db")
 if not logger.handlers:
     _diag_handler = logging.StreamHandler()
@@ -297,16 +300,19 @@ def revoke_infection_site(record_id: str, revoked_by: str) -> dict:
 # ==== 统计窗口交集化 ====
 # 缺陷根源:分母限定统计月,分子却放开整段住院期。
 # 任何"当月是否发生过某事件"的查询,时间条件都必须来自本函数。
-def _month_window(pat, start_dt, end_dt):
+def _month_window(pat, start_dt, end_dt_wide):
     """返回患者 pat 在统计月内的有效观察窗口 [win_start, win_end]。
 
     win_start = max(月初 00:00:00, icuAdmissionTime)
     win_end   = min(月末 23:59:59, icuDischargeTime)  未出科取月末,绝不用 now()
 
+    入参均为 UTC 帧瞬间（start_dt=北京月初00:00 的 UTC 值，
+    end_dt_wide=北京月末23:59:59 的 UTC 值，见 tzutil）。
+
     若返回的 win_start > win_end,表示该患者本月不在科,调用方必须 continue。
     """
     month_start = start_dt
-    month_end = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    month_end = end_dt_wide
 
     admit = pat.get("icuAdmissionTime")
     win_start = max(month_start, admit) if isinstance(admit, datetime) else month_start
@@ -315,6 +321,31 @@ def _month_window(pat, start_dt, end_dt):
     # 关键:未出科 -> 取月末,不是 datetime.now()
     win_end = min(month_end, discharge) if isinstance(discharge, datetime) else month_end
 
+    return win_start, win_end
+
+
+def _stay_window(pat, end_dt_wide):
+    """返回该次 ICU 住院（在科记录）自身的观察窗口 [admit, min(discharge, 月末)+24h]。
+
+    与 _month_window 的区别：起点取**入科时间本身**（可早于月初）——
+    「原有患者」入科时（上个月）做的首次 APACHEⅡ 评分 / 评估，
+    属于本次住院期间，分子判定必须能看到（#fix 原有患者满足分子却漏计）。
+
+    终点含出科后 24h 宽限：出科操作触发的评分/评估补录常晚于出科瞬间
+    （实证：陈杰新出科后 8 秒、游绍禄出科后 9.7h 补录 APACHEⅡ，此前被上界滤掉）。
+    文档 pid 本身即该在科记录 _id，归属无歧义，宽限只是容纳晚录入。
+
+    入参均为 UTC 帧瞬间。返回 None 表示该次住院与统计期无交集（不应出现在分母队列）。
+    """
+    admit = pat.get("icuAdmissionTime")
+    win_start = admit if isinstance(admit, datetime) else None
+    discharge = pat.get("icuDischargeTime")
+    if isinstance(discharge, datetime):
+        win_end = min(discharge, end_dt_wide) + timedelta(hours=24)
+    else:
+        win_end = end_dt_wide
+    if win_start is not None and win_start > win_end:
+        return None
     return win_start, win_end
 
 
@@ -545,8 +576,8 @@ def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
     返回：开放床位数，无数据返回 0
     """
     try:
-        start_dt = datetime.fromisoformat(start_date)
-        end_dt = datetime.fromisoformat(end_date)
+        start_dt = utc_day_start(start_date)
+        end_dt = utc_day_start(end_date)
     except ValueError:
         return 0
 
@@ -558,7 +589,7 @@ def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
             # 用正则匹配目标 dept_code
             bed_record = db.bedRecord.find_one({
                 "deptCode": {"$regex": dept_code},
-                "time": {"$gte": start_dt, "$lte": end_dt},
+                "time": {"$gte": start_dt, "$lte": utc_day_end_wide(end_date)},
             })
             if bed_record and bed_record.get("bedNum"):
                 return int(bed_record["bedNum"])
@@ -611,8 +642,11 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
     返回：占用总床日数，无数据返回 0
     """
     try:
-        start_dt = datetime.fromisoformat(start_date)
-        end_dt = datetime.fromisoformat(end_date)
+        start_dt = utc_day_start(start_date)
+        end_dt = utc_day_start(end_date)
+        # 北京墙钟日历日（床日按北京日切，勿用 UTC 帧的 y/m/d）
+        start_day = datetime.fromisoformat(start_date).date()
+        end_day = datetime.fromisoformat(end_date).date()
     except ValueError:
         return 0
 
@@ -626,7 +660,7 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
                 {
                     "deptCode": dept_code,
                     "status": {"$ne": "invalid"},
-                    "icuAdmissionTime": {"$lte": datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)},
+                    "icuAdmissionTime": {"$lte": utc_day_end_wide(end_date)},
                     "$or": [
                         {"icuDischargeTime": {"$gte": start_dt}},
                         {"icuDischargeTime": None},
@@ -646,23 +680,19 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
                 if not admit_dt:
                     continue
 
-                # 患者"在科"的午夜范围：
-                # 首个在科午夜 = 入科日期的次日 0:00（入院当日不计）
-                first_midnight = datetime(
-                    admit_dt.year, admit_dt.month, admit_dt.day
-                ) + timedelta(days=1)
+                # 患者"在科"的日历日范围（按北京墙钟日切，存储为 UTC，见 tzutil）：
+                # 首个在科日 = 入科北京日期的次日（入院当日不计）
+                first_day = to_bj_naive(admit_dt).date() + timedelta(days=1)
 
-                # 末个在科午夜 = 出科日期的 0:00（出院当日计入）
+                # 末个在科日 = 出科北京日期当日（出院当日计入）
                 if discharge_dt:
-                    last_midnight = datetime(
-                        discharge_dt.year, discharge_dt.month, discharge_dt.day
-                    )
+                    last_day = to_bj_naive(discharge_dt).date()
                 else:
-                    last_midnight = end_dt  # 未出院，计到统计期末
+                    last_day = end_day  # 未出院，计到统计期末（北京末日）
 
                 # 与统计期取交集
-                first = max(first_midnight, start_dt)
-                last = min(last_midnight, end_dt)
+                first = max(first_day, start_day)
+                last = min(last_day, end_day)
 
                 if first <= last:
                     total += (last - first).days + 1
@@ -737,7 +767,7 @@ def get_staff_count(dept_code: str, role: str) -> int:
 
 
 # ============================================================
-# ICU 分母共用查询（ICU-04 / ICU-07 等「同期在科患者」口径）
+# ICU 分母共用查询（ICU-04-01 / ICU-07 等「同期在科患者」口径）
 # ============================================================
 
 def get_icu_denominator_stays(dept_codes: list, start_date: str, end_date: str) -> list:
@@ -747,13 +777,13 @@ def get_icu_denominator_stays(dept_codes: list, start_date: str, end_date: str) 
     条件：deptCode 属于本科室、status != invalid、
           icuAdmissionTime <= 期末 且 (icuDischargeTime >= 期初 或 未出院)。
 
-    ICU-04、ICU-07 等分母共用此查询，保证分子分母来自同一队列。
+    ICU-04-01、ICU-07 等分母共用此查询，保证分子分母来自同一队列。
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_of_day = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_of_day = utc_day_end_wide(end_date)
 
     for _db_name, db in iter_bed_dbs():
         try:
@@ -798,12 +828,12 @@ def dedup_persons(rows: list, time_key: str = "icuAdmissionTime") -> list:
     """
     人数口径去重：同一患者多条记录只保留 time_key 最早的一条。
 
-    ICU-04 / ICU-07 / ICU-09 / ICU-10 的 INDICATORS_CONFIG 定义分子分母都是
+    ICU-04-01 / ICU-07 / ICU-09 / ICU-10 的 INDICATORS_CONFIG 定义分子分母都是
     「患者数」，而 SmartCare patient 表一行 = 一次 ICU 入住，直接 len() 得到的是
     人次（2026-09 科室3439 有 7 人各入科 2 次：145 人次 / 138 人）。
     分子分母都要过这里，才能保证两边都是「人数」。
 
-    time_key: 决定保留哪一条（ICU-04 分子用 score_time、ICU-09/10 用 assess_time）。
+    time_key: 决定保留哪一条（ICU-04-01 分子用 score_time、ICU-09/10 用 assess_time）。
     """
     best = {}
     for row in rows:
@@ -823,67 +853,82 @@ def dedup_persons(rows: list, time_key: str = "icuAdmissionTime") -> list:
 
 
 # ============================================================
-# ICU-04：APACHEⅡ≥15 收治率
+# ICU-04-01：APACHEⅡ≥15 收治率
 # ============================================================
 
 def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     返回 {den_count, num_count, num_patients, den_patients}
 
-    分母：统计期内该科室在科患者数（status != invalid，入出科时间与统计期有交集）
-    分子：分母患者中，当月首次 apacheII 评分 total ≥ 15 的人数
+    分母：统计期内该科室在科记录（status != invalid，入出科时间与统计期有交集）
+    分子：分母在科记录中，**本次住院期间**首次 apacheII 评分 total ≥ 15 的人次
 
-    口径：人数（按 mrn 去重）—— 同一患者当月多次入科只算一人，
-          分子分母均经 dedup_persons 归并；评分关联仍覆盖其全部在科记录。
+    口径：人次（一次入科算一人次，不按 mrn 去重）。
+    评分窗口 = 本次住院 [入科, 出科∧月末]（_stay_window）——
+    「原有患者」上个月入科时做的首次评分同样计入（#fix 原有患者满足分子却漏计）。
     """
     from datetime import datetime as dt, timedelta
     from bson import ObjectId
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    end_dt = utc_day_start(end_date)
+    end_wide = utc_day_end_wide(end_date)
 
-    result = {"den_count": 0, "num_count": 0, "num_patients": [], "den_patients": []}
+    result = {"den_count": 0, "num_count": 0, "num_patients": [], "den_patients": [],
+              "score_map": {}}   # str(在科_id) → 本次住院首次 apacheII total（明细标 未评/已评）
 
-    # 分母：在科记录（与 ICU-07 共用 get_icu_denominator_stays，保证同队列）
+    # 分母：在科记录（与 ICU-07 共用 get_icu_denominator_stays，保证同队列）；
+    # 人次口径：一条在科记录 = 一人次，明细与计数同为一行一人次
     all_stays = get_icu_denominator_stays(dept_codes, start_date, end_date)
-    # 人数口径：明细与计数一人一行；den_ids 仍取全部在科记录，
-    # 否则第二次入科做的评分会因为 pid 不在关联集合里被整条丢掉
-    den_patients = dedup_persons(all_stays)
     den_ids = [str(p["_id"]) for p in all_stays]
-    result["den_count"] = len(den_patients)
-    result["den_patients"] = den_patients
+    result["den_count"] = len(all_stays)
+    result["den_patients"] = all_stays
     if not den_ids:
         return result
 
+    pat_map = {str(p["_id"]): p for p in all_stays}
+    # 每条在科记录自身的观察窗口 [入科, 出科∧月末]，分子按此窗口判定
+    win_map = {}
+    for pid_str, p in pat_map.items():
+        w = _stay_window(p, end_wide)
+        if w:
+            win_map[pid_str] = w
+
     for db_name, db in iter_bed_dbs():
         try:
+            # 分子：拉取分母队列全部 apacheII 评分（≤月末，不限月初），
+            # Python 侧按每条在科记录的窗口取「本次住院首次」——
+            # 上个月入科时打的首次评分也能命中
+            cursor = db.score.find(
+                {"pid": {"$in": den_ids},
+                 "scoreType": "apacheII",
+                 "valid": True,
+                 "time": {"$lte": end_wide}},
+                {"pid": 1, "total": 1, "time": 1},
+            ).sort("time", 1)
+            first_by_pid = {}
+            for s in cursor:
+                pid_str = s.get("pid", "")
+                if pid_str in first_by_pid:
+                    continue  # 该次住院已取到首次评分
+                w = win_map.get(pid_str)
+                if not w:
+                    continue
+                t = s.get("time")
+                if not isinstance(t, dt) or t < w[0] or t > w[1]:
+                    continue  # 不在本次住院窗口内（早于入科/晚于出科的脏数据）
+                first_by_pid[pid_str] = s
 
-            # 分子：聚合查询 — 一次查出所有患者的首次 apacheII 评分
-            pipeline = [
-                {"$match": {
-                    "pid": {"$in": den_ids},
-                    "scoreType": "apacheII",
-                    "valid": True,
-                    "time": {
-                        "$gte": start_dt,
-                        "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
-                    },
-                }},
-                {"$sort": {"time": 1}},
-                {"$group": {
-                    "_id": "$pid",
-                    "total": {"$first": "$total"},
-                    "score_time": {"$first": "$time"},
-                }},
-                {"$match": {"total": {"$gte": 15}}},
-            ]
-            high_scores = {s["_id"]: s for s in list(db.score.aggregate(pipeline))}
+            # 分母明细「未评/已评」标记：有本次住院窗口内有效评分即已评（与分值无关）
+            result["score_map"] = {k: v.get("total") for k, v in first_by_pid.items()}
 
-            # 构建患者映射 —— 必须覆盖全部在科记录（含同一患者的第二次入科），
-            # 否则只在第二次入科做的评分会查不到患者而被丢掉
-            pat_map = {str(p["_id"]): p for p in all_stays}
             num_rows = []
-            for pid_str, s in high_scores.items():
+            for pid_str, s in first_by_pid.items():
+                try:
+                    total = float(s.get("total"))
+                except (TypeError, ValueError):
+                    continue
+                if total < 15:
+                    continue
                 p = pat_map.get(pid_str)
                 if p:
                     num_rows.append({
@@ -893,14 +938,12 @@ def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> d
                         "name": p.get("name", ""),
                         "hisBed": p.get("hisBed", ""),
                         "score": s.get("total", 0),
-                        "score_time": s.get("score_time"),
+                        "score_time": s.get("time"),
                     })
 
-            # 人数口径：同一患者两次入科都达标时只算一人，取更早的那次评分
-            # （对应定义里的「首次 APACHEⅡ 评分」）
-            num_patients = dedup_persons(num_rows, time_key="score_time")
-            result["num_count"] = min(len(num_patients), result["den_count"])
-            result["num_patients"] = num_patients
+            # 人次口径：一行一在科记录，不按 mrn 去重
+            result["num_count"] = len(num_rows)
+            result["num_patients"] = num_rows
             break
 
         except Exception as _exc:
@@ -919,10 +962,11 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
     返回 {lt10, 10_15, 15_20, 20_25, ge25, scored, den_count,
          bands: {桶名: [患者明细]}, den_patients}
 
-    队列/人数口径与 ICU-04 完全一致：
-      分母 = get_icu_denominator_stays + dedup_persons（人数口径）。
-    评分口径 = 分母患者中，当月首次 apacheII total（$sort time + $group $first，
-             不设 total 阈值）。无评分的不进桶。
+    队列/口径与 ICU-04-01 完全一致：
+      分母 = get_icu_denominator_stays（人次口径，一条在科记录 = 一人次）。
+    评分口径 = 分母在科记录中，**本次住院期间**首次 apacheII total
+             （窗口 [入科, 出科∧月末]，不限统计月内，不设 total 阈值）。
+    无评分的不进桶。
 
     分值边界（半开区间，与上报表截图 6–10 行一致）：
       lt10  = total < 10
@@ -933,22 +977,22 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    end_dt = utc_day_start(end_date)
+    end_wide = utc_day_end_wide(end_date)
 
     result = {
         "lt10": 0, "10_15": 0, "15_20": 0, "20_25": 0, "ge25": 0,
         "scored": 0, "den_count": 0,
         "bands": {"lt10": [], "10_15": [], "15_20": [], "20_25": [], "ge25": []},
         "den_patients": [],
+        "score_map": {},   # str(在科_id) → 首次 apacheII total（分母明细标 未评/已评）
     }
 
-    # 分母：与 ICU-04 完全相同的在科队列 + 人数去重
+    # 分母：与 ICU-04-01 完全相同的在科队列（人次口径，不去重）
     all_stays = get_icu_denominator_stays(dept_codes, start_date, end_date)
-    den_patients = dedup_persons(all_stays)
     den_ids = [str(p["_id"]) for p in all_stays]
-    result["den_count"] = len(den_patients)
-    result["den_patients"] = den_patients
+    result["den_count"] = len(all_stays)
+    result["den_patients"] = all_stays
     if not den_ids:
         return result
 
@@ -968,33 +1012,43 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
             return "20_25"
         return "ge25"
 
+    pat_map = {str(p["_id"]): p for p in all_stays}
+    win_map = {}
+    for pid_str, p in pat_map.items():
+        w = _stay_window(p, end_wide)
+        if w:
+            win_map[pid_str] = w
+
     for db_name, db in iter_bed_dbs():
         try:
-            # 一次聚合：每患者当月首次 apacheII total（与 get_icu04 同 pipeline，
-            # 但去掉 $match total≥15，保留全部有评分患者）
-            pipeline = [
-                {"$match": {
-                    "pid": {"$in": den_ids},
-                    "scoreType": "apacheII",
-                    "valid": True,
-                    "time": {
-                        "$gte": start_dt,
-                        "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
-                    },
-                }},
-                {"$sort": {"time": 1}},
-                {"$group": {
-                    "_id": "$pid",
-                    "total": {"$first": "$total"},
-                    "score_time": {"$first": "$time"},
-                }},
-            ]
-            first_scores = {s["_id"]: s for s in list(db.score.aggregate(pipeline))}
+            # 拉取分母队列全部 apacheII 评分（≤月末，不限月初），Python 侧
+            # 按每条在科记录窗口取「本次住院首次」——原有患者上个月入科时
+            # 打的首次评分同样进桶
+            cursor = db.score.find(
+                {"pid": {"$in": den_ids},
+                 "scoreType": "apacheII",
+                 "valid": True,
+                 "time": {"$lte": end_wide}},
+                {"pid": 1, "total": 1, "time": 1},
+            ).sort("time", 1)
+            first_by_pid = {}
+            for s in cursor:
+                pid_str = s.get("pid", "")
+                if pid_str in first_by_pid:
+                    continue
+                w = win_map.get(pid_str)
+                if not w:
+                    continue
+                t = s.get("time")
+                if not isinstance(t, dt) or t < w[0] or t > w[1]:
+                    continue
+                first_by_pid[pid_str] = s
 
-            # pid → 患者映射（覆盖全部在科记录，含同一患者第二次入科）
-            pat_map = {str(p["_id"]): p for p in all_stays}
+            # 分母明细「未评/已评」标记（含无法落桶的分值，只看有无评分）
+            result["score_map"] = {k: v.get("total") for k, v in first_by_pid.items()}
+
             scored_rows = []
-            for pid_str, s in first_scores.items():
+            for pid_str, s in first_by_pid.items():
                 p = pat_map.get(pid_str)
                 if not p:
                     continue
@@ -1005,13 +1059,11 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
                     "name": p.get("name", ""),
                     "hisBed": p.get("hisBed", ""),
                     "score": s.get("total"),
-                    "score_time": s.get("score_time"),
+                    "score_time": s.get("time"),
                 })
 
-            # 人数口径：同一患者多次入科只保留更早的那次评分（「当月首次」）
-            scored_patients = dedup_persons(scored_rows, time_key="score_time")
-
-            for p in scored_patients:
+            # 人次口径：一行一在科记录，不按 mrn 去重
+            for p in scored_rows:
                 b = _bucket(p.get("score"))
                 if b is None:
                     continue
@@ -1045,8 +1097,8 @@ def get_bundle_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
 
     result = {"total": 0, "h1_num": 0, "h3_num": 0, "h6_num": 0,
               "h1_patients": [], "h3_patients": [], "h6_patients": [], "den_patients": []}
@@ -1061,7 +1113,7 @@ def get_bundle_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "valid": {"$ne": False},
                     "diagnosisTime": {
                         "$gte": start_dt,
-                        "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
+                        "$lte": utc_day_end_wide(end_date),
                     },
                 },
                 {"pid": 1, "patientName": 1, "mrn": 1, "diagnosisTime": 1},
@@ -1281,8 +1333,8 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
     """
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
 
     result = {
         "total": 0, "h1_num": 0, "h3_num": 0, "h6_num": 0,
@@ -1311,7 +1363,7 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
                 "diagnose": {"$regex": SEPSIS_DIAG_KEYWORDS, "$options": "i"},
                 "admitTime": {
                     "$gte": start_dt,
-                    "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
+                    "$lte": utc_day_end_wide(end_date),
                 },
             }
         if dept_codes:
@@ -1780,8 +1832,8 @@ def get_ards_denominator(dept_codes: list, start_date: str, end_date: str,
     from datetime import datetime as dt, timedelta
     from bson import ObjectId
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
 
     result = {"total": 0, "patients": []}
     seen_pids = set()
@@ -1798,7 +1850,7 @@ def get_ards_denominator(dept_codes: list, start_date: str, end_date: str,
                             "deptCode": {"$in": dept_codes},
                             "eventExe.startTime": {
                                 "$gte": start_dt,
-                                "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59),
+                                "$lte": utc_day_end_wide(end_date),
                             },
                             "bedsides": {
                                 "$elemMatch": {
@@ -1933,8 +1985,9 @@ def get_ards_prone_numerator(den_patients: list, dept_codes: list,
     from datetime import datetime as dt
     from bson import ObjectId
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {"num_count": 0, "num_patients": []}
 
@@ -1960,7 +2013,7 @@ def get_ards_prone_numerator(den_patients: list, dept_codes: list,
                     continue
 
                 # 使用交集窗口，未出科取月末，绝不用 now()
-                win_start, win_end = _month_window(pat, start_dt, end_dt)
+                win_start, win_end = _month_window(pat, start_dt, end_dt_wide)
                 if win_start > win_end:
                     continue  # 本月不在科
 
@@ -2032,8 +2085,8 @@ def get_icu08_data(dept_codes: list, start_date: str, end_date: str,
     if ICU08_PAIR_MODE == "locf_8h":
         time_tolerance_min = 480  # 8h LOCF 窗口
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
     den_patients = []
     seen_pids = set()
 
@@ -2046,7 +2099,7 @@ def get_icu08_data(dept_codes: list, start_date: str, end_date: str,
                 try:
                     bgas = list(db[coll_name].find(
                         {"deptCode": {"$in": dept_codes},
-                         "eventExe.startTime": {"$gte": start_dt, "$lte": dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)},
+                         "eventExe.startTime": {"$gte": start_dt, "$lte": utc_day_end_wide(end_date)},
                          "bedsides": {"$elemMatch": {"code": {"$in": ["param_bg_P/Fratio", "param_bg_OI", "param_bg_po2"]}, "valid": "valid"}}},
                         {"eventExe.pid": 1, "eventExe.startTime": 1, "bedsides": 1, "mrn": 1},
                     ).sort("eventExe.startTime", 1))
@@ -2293,26 +2346,31 @@ def classify_dvt_order(order_name: str, exe_method=None, exe_code=None) -> str:
 
 def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
-    ICU-07 分子：实施了 DVT 预防措施的患者。
+    ICU-07 分子：实施了 DVT 预防措施的在科记录。
     数据源：DataCenter.VI_ICU_ZYYZ（医嘱名称关键词匹配 + 给药途径过滤）。
 
-    队列 = 分母队列（get_icu_denominator_stays，与 ICU-04 完全一致），
+    队列 = 分母队列（get_icu_denominator_stays，与 ICU-04-01 完全一致），
     再按 mrn 反查 DataCenter.VI_ICU_ZYBR.pid 取医嘱。
 
     ⚠ 这里不能用 VI_ICU_ZYBR.deptCode 过滤：该表每个 mrn 只保留最近一次住院科室记录，
       已转出本科室的患者会被整条剔除（2026-09 科室3439 曾因此漏计 12 人）。
 
+    口径：**人次**（一条在科记录一行，不按 mrn 去重）。
+    分子判定从分母每条在科记录出发：该次住院窗口 [入科, 出科∧月末] 内
+    有药物/机械预防医嘱即计入——「原有患者」上个月入科时下的医嘱同样命中
+    （#fix 原有患者满足分子却漏计）。
+
     返回:
-        drug_patients / mech_patients / filter_patients —— 按人归类的明细列表
-        all_count      —— 纳入分子的患者数（人数口径，算比率用它）
-        all_stay_count —— 纳入分子的在科人次（仅审计对照用，不参与比率）
-        num_stays      —— 分子明细（人数口径，与 all_count 行数一致）
+        drug_patients / mech_patients / filter_patients —— 按人归类的明细列表（审计用）
+        all_count      —— 纳入分子的在科人次（算比率用它）
+        all_stay_count —— 同 all_count（保留字段兼容旧消费方）
+        num_stays      —— 分子明细（一行一在科记录，与 all_count 行数一致）
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_of_day = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_of_day = utc_day_end_wide(end_date)
 
     result = {
         "drug_pids": set(), "mech_pids": set(), "filter_pids": set(),
@@ -2321,13 +2379,13 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
     }
 
     try:
-        # Step 1: 分母队列（按人次），与 ICU-04 同一查询 —— 保证分子分母同队列
+        # Step 1: 分母队列（按人次），与 ICU-04-01 同一查询 —— 保证分子分母同队列
         stays = get_icu_denominator_stays(dept_codes, start_date, end_date)
         den_mrns = {s.get("mrn") for s in stays if s.get("mrn")}
         if not den_mrns:
             return result
 
-        # 代表次在科：与分母明细同样取该患者入科最早的一次，分子分母行能对上
+        # 代表次在科：与分母明细同样取该患者入科最早的一次（仅审计列表用）
         den_persons = dedup_persons(stays)
         stay_by_mrn = {s.get("mrn"): s for s in den_persons}
 
@@ -2343,19 +2401,26 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
         if not valid_pids:
             return result
 
-        # Step 3: 统计期内的医嘱
+        # Step 3: 医嘱——下界放宽到分母队列最早入科时间（覆盖「原有患者」
+        # 入科时即下医嘱的情况），上界仍为月末；按次住院窗口的精确匹配在 Step 5
         rx = _dvt_patterns()
+        order_q = {
+            "pid": {"$in": list(valid_pids)},
+            "orderName": {"$regex": rx["all"].pattern, "$options": "i"},
+            "orderTime": {"$lte": end_of_day},
+            "status": {"$in": EXECUTED_ORDER_STATUSES},
+        }
+        admits = [s.get("icuAdmissionTime") for s in stays
+                  if isinstance(s.get("icuAdmissionTime"), dt)]
+        if admits:
+            order_q["orderTime"]["$gte"] = min(admits)
         orders = list(db["VI_ICU_ZYYZ"].find(
-            {
-                "pid": {"$in": list(valid_pids)},
-                "orderName": {"$regex": rx["all"].pattern, "$options": "i"},
-                "orderTime": {"$gte": start_dt, "$lte": end_of_day},
-                "status": {"$in": EXECUTED_ORDER_STATUSES},
-            },
+            order_q,
             {"pid": 1, "orderName": 1, "orderTime": 1, "exeMethod": 1, "exeMethodCode": 1},
         ).limit(200000))
 
         # Step 4: 分类（剔检验假匹配 / 名称封管 / 给药途径为管路维护或血液净化）
+        # 每条医嘱保留 (名称, 开立时间) 供按次住院窗口匹配
         drug_by_pid, mech_by_pid, filter_by_pid = {}, {}, {}
         for o in orders:
             pid = o.get("pid", "")
@@ -2368,24 +2433,20 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
             if mrn not in den_mrns:
                 continue
             kind = classify_dvt_order(name, o.get("exeMethod"), o.get("exeMethodCode"))
+            entry = (name, o.get("orderTime"))
             if kind == "drug":
-                drug_by_pid.setdefault(pid, []).append(name)
+                drug_by_pid.setdefault(pid, []).append(entry)
             elif kind == "mech":
-                mech_by_pid.setdefault(pid, []).append(name)
+                mech_by_pid.setdefault(pid, []).append(entry)
             elif kind == "filter":
-                filter_by_pid.setdefault(pid, []).append(name)
+                filter_by_pid.setdefault(pid, []).append(entry)
 
         result["drug_pids"] = set(drug_by_pid)
         result["mech_pids"] = set(mech_by_pid)
         result["filter_pids"] = set(filter_by_pid)
-        all_pids = set(drug_by_pid) | set(mech_by_pid)
-
-        # Step 5: 患者数 / 人次
-        all_mrns = {zybr_by_pid[p].get("mrn") for p in all_pids} & den_mrns
-        result["all_count"] = len(all_mrns)
-        result["all_stay_count"] = sum(1 for s in stays if s.get("mrn") in all_mrns)
 
         def build_list(by_pid):
+            """按 DataCenter pid 归类的审计列表（mrn 级，保留字段兼容 report_export）。"""
             out = []
             for pid, olist in by_pid.items():
                 zybr = zybr_by_pid.get(pid, {})
@@ -2399,7 +2460,7 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
                     "hisBed": stay.get("hisBed", ""),
                     "icuAdmissionTime": stay.get("icuAdmissionTime"),
                     "icuDischargeTime": stay.get("icuDischargeTime"),
-                    "matched_orders": olist[:5],
+                    "matched_orders": [n for n, _t in olist[:5]],
                     "order_count": len(olist),
                 })
             return out
@@ -2408,23 +2469,33 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
         result["mech_patients"] = build_list(mech_by_pid)
         result["filter_patients"] = build_list(filter_by_pid)
 
-        # 分子明细先按在科记录展开（便于核对 all_stay_count），
-        # 再 dedup_persons 归并成人数口径 —— 与分母明细、all_count 同为一人一行。
-        orders_by_mrn = defaultdict(list)
-        for src in (drug_by_pid, mech_by_pid):
-            for _pid, names in src.items():
+        # Step 5: 分子 —— 从分母每条在科记录出发，该次住院窗口内
+        # 有药物/机械预防医嘱即计入（人次口径，一行一在科记录）
+        orders_by_mrn = defaultdict(list)   # mrn → [(name, time, kind)]
+        for src, kind in ((drug_by_pid, "drug"), (mech_by_pid, "mech")):
+            for _pid, entries in src.items():
                 _mrn = zybr_by_pid.get(_pid, {}).get("mrn")
                 if _mrn:
-                    orders_by_mrn[_mrn].extend(names)
-        drug_mrns = {zybr_by_pid[p].get("mrn") for p in drug_by_pid} & den_mrns
-        mech_mrns = {zybr_by_pid[p].get("mrn") for p in mech_by_pid} & den_mrns
+                    orders_by_mrn[_mrn].extend((n, t, kind) for n, t in entries)
+
         num_stays = []
         for s in stays:
             mrn = s.get("mrn")
-            if mrn not in all_mrns:
+            w = _stay_window(s, end_of_day)
+            if not w:
                 continue
-            in_drug, in_mech = mrn in drug_mrns, mrn in mech_mrns
-            names = orders_by_mrn.get(mrn, [])
+            in_drug = in_mech = False
+            names = []
+            for name, t, kind in orders_by_mrn.get(mrn, []):
+                if isinstance(t, dt) and (t < w[0] or t > w[1]):
+                    continue  # 医嘱不在该次住院窗口内（属于另一次入科）
+                names.append(name)
+                if kind == "drug":
+                    in_drug = True
+                else:
+                    in_mech = True
+            if not names:
+                continue
             num_stays.append({
                 "patient_id": s.get("hisPid") or mrn,
                 # stay_id = SmartCare patient._id，与分母明细同一主键，
@@ -2441,13 +2512,14 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
                 "order_count": len(names),
                 "matched_orders": names[:5],
             })
-        # 人数口径：同一患者多次入科合并为一行（保留入科最早的一次），
-        # 行数应与 all_count 相等（icu07_verify_api.py 会校验）
-        result["num_stays"] = dedup_persons(num_stays)
+        # 人次口径：不按 mrn 去重，行数 == all_count
+        result["num_stays"] = num_stays
+        result["all_count"] = len(num_stays)
+        result["all_stay_count"] = len(num_stays)
 
         print(f"[ICU-07] 分母 {len(stays)}人次/{len(den_mrns)}人 | "
-              f"分子 {result['all_count']}人/{result['all_stay_count']}人次 | "
-              f"药物 {len(drug_by_pid)}人 机械 {len(mech_by_pid)}人")
+              f"分子 {result['all_count']}人次 | "
+              f"药物 {len(drug_by_pid)}pid 机械 {len(mech_by_pid)}pid")
 
     except Exception as e:
         print(f"[ICU-07] Error: {e}")
@@ -3094,7 +3166,7 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
                 'value': round(val, 2),
                 'raw_value': val,
                 'unit': 'mmol/L',
-                'sample_time': t.isoformat() if hasattr(t, 'isoformat') else str(t),
+                'sample_time': fmt_bj(t, "%Y-%m-%dT%H:%M:%S"),
                 'time_basis': '采样时间',
                 'source': 'bGATemp(血气分析)',
                 'minutes_from_t0': minutes_from_t0,
@@ -3390,8 +3462,8 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
         result['sofa'] = {
             'classic': sofa_result['classic'],
             'sofa2': sofa_result['sofa2'],
-            'eval_time': str(eval_time),
-            't0': str(t0),
+            'eval_time': fmt_bj(eval_time, "%Y-%m-%d %H:%M:%S"),
+            't0': fmt_bj(t0, "%Y-%m-%d %H:%M:%S"),
             'version_meta': sofa_result.get('version_meta', {}),
             'data_complete': sofa_result.get('data_complete', True),
         }
@@ -4096,9 +4168,9 @@ def get_icu06_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
         "den_count": 0, "num_count": 0,
@@ -4420,9 +4492,9 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-09：镇痛评估率。
 
-    分母 = 统计期内本科室 ICU 患者总人数（按 mrn 去重的**人数**口径，无排除；
-          同一患者当月多次入科只算一人）。
-    分子 = 分母中住 ICU 期间进行过 ≥1 次镇痛评估的患者数（同样按患者去重）。
+    分母 = 统计期内本科室在科记录（**人次**口径，一条记录一人次，无排除）。
+    分子 = 分母在科记录中，**本次住院期间**（窗口 [入科, 出科∧月末]）进行过
+          ≥1 次镇痛评估的人次——「原有患者」上个月入科时做的评估同样计入。
 
     分子源 A（优先）：bedside 表，code ∈ BEDSIDE_PAIN_CODES 且 valid=True。
           命中患者不再回查源 B。
@@ -4437,9 +4509,9 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {"den_count": 0, "num_count": 0,
               "den_patients": [], "num_patients": []}
@@ -4470,8 +4542,8 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 den_pids_obj.add(spid)
                 pat_by_strpid[spid] = p
 
-            # 人数口径：分母按患者去重，多次入科只算一人
-            result["den_count"] = len(dedup_persons(patients))
+            # 人次口径：分母一条在科记录 = 一人次，不按 mrn 去重
+            result["den_count"] = len(patients)
             if not den_pids_obj:
                 continue
 
@@ -4482,26 +4554,28 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             a_detail = {}  # strpid → {scale_name, time}
 
             try:
-                # 批量查 bedside，只取需要的字段
+                # 批量查 bedside，只取需要的字段；
+                # 时间上界=月末、不设下界——评估窗口按每条在科记录自身
+                # [入科, 出科∧月末] 判定，原有患者上个月入科时的评估也要命中
                 bedside_docs = list(db.bedside.find(
                     {"pid": {"$in": den_pids_list},
                      "code": {"$in": list(BEDSIDE_PAIN_CODES)},
                      "valid": True,
-                     "time": {"$gte": start_dt, "$lte": end_dt_wide}},
+                     "time": {"$lte": end_dt_wide}},
                     {"pid": 1, "strVal": 1, "history": 1, "time": 1},
-                ).max_time_ms(10000).limit(100000))
+                ).sort("time", 1).max_time_ms(10000).limit(100000))
 
                 for doc in bedside_docs:
                     spid = doc.get("pid", "")
                     if spid not in den_pids_obj:
                         continue
 
-                    # 时间窗口：评估必须在本次 ICU 住院期间（交集窗口）
+                    # 时间窗口：评估必须在本次 ICU 住院期间
                     p = pat_by_strpid.get(spid)
                     at = doc.get("time")
                     if p and at:
-                        win_start, win_end = _month_window(p, start_dt, end_dt)
-                        if at < win_start or at > win_end:
+                        w = _stay_window(p, end_dt_wide)
+                        if not w or at < w[0] or at > w[1]:
                             continue
 
                     # 取评分值：优先 strVal，无则 history[].desc
@@ -4540,21 +4614,21 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                         {"pid": {"$in": need_b},
                          "scoreType": {"$in": list(SCORE_PAIN_TYPES)},
                          "valid": True,
-                         "time": {"$gte": start_dt, "$lte": end_dt_wide}},
+                         "time": {"$lte": end_dt_wide}},
                         {"pid": 1, "scoreType": 1, "total": 1, "score": 1,
                          "value": 1, "fVal": 1, "iVal": 1, "strVal": 1, "time": 1},
-                    ).max_time_ms(10000).limit(50000))
+                    ).sort("time", 1).max_time_ms(10000).limit(50000))
 
                     for doc in score_docs:
                         spid = doc.get("pid", "")
                         if spid not in den_pids_obj:
                             continue
-                        # 时间窗口（交集窗口）
+                        # 时间窗口：本次住院期间（原有患者上月入科时的评估也算）
                         p = pat_by_strpid.get(spid)
                         at = doc.get("time")
                         if p and at:
-                            win_start, win_end = _month_window(p, start_dt, end_dt)
-                            if at < win_start or at > win_end:
+                            w = _stay_window(p, end_dt_wide)
+                            if not w or at < w[0] or at > w[1]:
                                 continue
                         stype = doc.get("scoreType", "painScore")
                         if spid not in b_pids:
@@ -4571,8 +4645,7 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             # ---- 4. 分子 = A ∪ B ----
             num_pids = a_pids | b_pids
 
-            # ---- 5. 构建明细（人数口径：一人一行）----
-            # 分母明细取每个患者入科最早的一次在科记录
+            # ---- 5. 构建明细（人次口径：一条在科记录一行）----
             result["den_patients"] = [
                 {"pid": str(p["_id"]),
                  "mrn": p.get("mrn", "") or p.get("hisPid", ""),
@@ -4580,8 +4653,9 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                  "patient_id": p.get("hisPid", ""),
                  "hisBed": p.get("hisBed", ""),
                  "icu_admit": p.get("icuAdmissionTime"),
+                 "icu_discharge": p.get("icuDischargeTime"),
                  }
-                for p in dedup_persons(patients)
+                for p in patients
             ]
 
             num_rows = []
@@ -4598,9 +4672,9 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "assess_value": detail.get("score_value", ""),
                     "assess_time": detail.get("time"),
                 })
-            # 同一患者两次入科都有评估时只算一人，取更早的那次
-            result["num_patients"] = dedup_persons(num_rows, time_key="assess_time")
-            result["num_count"] = min(len(result["num_patients"]), result["den_count"])
+            # 人次口径：一行一在科记录，不按 mrn 去重
+            result["num_patients"] = num_rows
+            result["num_count"] = len(num_rows)
 
             break  # 拿到数据即退出库名循环
 
@@ -4628,9 +4702,9 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-10：镇静评估率。
 
-    分母 = 统计期内本科室 ICU 患者总人数（按 mrn 去重的**人数**口径，无排除；
-          同一患者当月多次入科只算一人）。
-    分子 = 分母中住 ICU 期间进行过 ≥1 次镇静评估（RASS）的患者数（同样按患者去重）。
+    分母 = 统计期内本科室在科记录（**人次**口径，一条记录一人次，无排除）。
+    分子 = 分母在科记录中，**本次住院期间**（窗口 [入科, 出科∧月末]）进行过
+          ≥1 次镇静评估（RASS）的人次——「原有患者」上个月入科时做的评估同样计入。
 
     分子源 A（优先）：bedside 表，code='param_score_rass_obs' 且 valid=True。
     分子源 B（兜底）：score 表，scoreType='rass' 且 valid=True。
@@ -4642,9 +4716,9 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {"den_count": 0, "num_count": 0,
               "den_patients": [], "num_patients": []}
@@ -4673,8 +4747,8 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 den_pids_obj.add(spid)
                 pat_by_strpid[spid] = p
 
-            # 人数口径：分母按患者去重，多次入科只算一人
-            result["den_count"] = len(dedup_persons(patients))
+            # 人次口径：分母一条在科记录 = 一人次，不按 mrn 去重
+            result["den_count"] = len(patients)
             if not den_pids_obj:
                 continue
             den_pids_list = list(den_pids_obj)
@@ -4684,24 +4758,26 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             a_detail = {}
 
             try:
+                # 时间上界=月末、不设下界——窗口按每条在科记录自身
+                # [入科, 出科∧月末] 判定，原有患者上个月入科时的评估也要命中
                 bedside_docs = list(db.bedside.find(
                     {"pid": {"$in": den_pids_list},
                      "code": BEDSIDE_SEDATION_CODE,
                      "valid": True,
-                     "time": {"$gte": start_dt, "$lte": end_dt_wide}},
+                     "time": {"$lte": end_dt_wide}},
                     {"pid": 1, "strVal": 1, "fVal": 1, "time": 1},
-                ).max_time_ms(10000).limit(100000))
+                ).sort("time", 1).max_time_ms(10000).limit(100000))
 
                 for doc in bedside_docs:
                     spid = doc.get("pid", "")
                     if spid not in den_pids_obj:
                         continue
-                    # 时间窗口：评估必须在本次 ICU 住院期间（交集窗口）
+                    # 时间窗口：评估必须在本次 ICU 住院期间
                     p = pat_by_strpid.get(spid)
                     at = doc.get("time")
                     if p and at:
-                        win_start, win_end = _month_window(p, start_dt, end_dt)
-                        if at < win_start or at > win_end:
+                        w = _stay_window(p, end_dt_wide)
+                        if not w or at < w[0] or at > w[1]:
                             continue
                     # RASS 值: strVal="-4"~"+4", fVal=-4.0~4.0
                     val = (doc.get("strVal") or "").strip()
@@ -4729,21 +4805,21 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                         {"pid": {"$in": need_b},
                          "scoreType": {"$in": list(SCORE_SEDATION_TYPES)},
                          "valid": True,
-                         "time": {"$gte": start_dt, "$lte": end_dt_wide}},
+                         "time": {"$lte": end_dt_wide}},
                         {"pid": 1, "scoreType": 1, "total": 1, "score": 1,
                          "value": 1, "fVal": 1, "iVal": 1, "strVal": 1, "time": 1},
-                    ).max_time_ms(10000).limit(50000))
+                    ).sort("time", 1).max_time_ms(10000).limit(50000))
 
                     for doc in score_docs:
                         spid = doc.get("pid", "")
                         if spid not in den_pids_obj:
                             continue
-                        # 时间窗口（交集窗口）
+                        # 时间窗口：本次住院期间（原有患者上月入科时的评估也算）
                         p = pat_by_strpid.get(spid)
                         at = doc.get("time")
                         if p and at:
-                            win_start, win_end = _month_window(p, start_dt, end_dt)
-                            if at < win_start or at > win_end:
+                            w = _stay_window(p, end_dt_wide)
+                            if not w or at < w[0] or at > w[1]:
                                 continue
                         if spid not in b_pids:
                             b_pids.add(spid)
@@ -4759,8 +4835,7 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             # ---- 4. 分子 = A ∪ B ----
             num_pids = a_pids | b_pids
 
-            # ---- 5. 构建明细（人数口径：一人一行）----
-            # 分母明细取每个患者入科最早的一次在科记录
+            # ---- 5. 构建明细（人次口径：一条在科记录一行）----
             result["den_patients"] = [
                 {"pid": str(p["_id"]),
                  "mrn": p.get("mrn", "") or p.get("hisPid", ""),
@@ -4768,8 +4843,9 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                  "patient_id": p.get("hisPid", ""),
                  "hisBed": p.get("hisBed", ""),
                  "icu_admit": p.get("icuAdmissionTime"),
+                 "icu_discharge": p.get("icuDischargeTime"),
                  }
-                for p in dedup_persons(patients)
+                for p in patients
             ]
 
             num_rows = []
@@ -4786,9 +4862,9 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "assess_value": detail.get("score_value", ""),
                     "assess_time": detail.get("time"),
                 })
-            # 同一患者两次入科都有评估时只算一人，取更早的那次
-            result["num_patients"] = dedup_persons(num_rows, time_key="assess_time")
-            result["num_count"] = min(len(result["num_patients"]), result["den_count"])
+            # 人次口径：一行一在科记录，不按 mrn 去重
+            result["num_patients"] = num_rows
+            result["num_count"] = len(num_rows)
 
             break
 
@@ -4827,9 +4903,9 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
         "den_count": 0.0,
@@ -4958,9 +5034,8 @@ def _is_true(value) -> bool:
 
 
 def _fmt_dt(value):
-    if hasattr(value, "strftime"):
-        return value.strftime("%Y-%m-%d %H:%M")
-    return str(value)[:16] if value else ""
+    # 库内/边界均为 UTC 帧 → 统一转北京时间展示（tzutil.fmt_bj）
+    return fmt_bj(value)
 
 
 def _get_airway_tube_data(dept_codes: list, start_date: str, end_date: str) -> dict:
@@ -4973,9 +5048,9 @@ def _get_airway_tube_data(dept_codes: list, start_date: str, end_date: str) -> d
     """
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     reinsert_until = end_dt_wide + timedelta(hours=48)
 
     result = {
@@ -5135,9 +5210,9 @@ def get_icu14_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
         "den_count": 0,
@@ -5297,9 +5372,9 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
         "den_count": 0,
@@ -5626,9 +5701,9 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     result = {
         "den_count": 0,
         "num_count": 0,
@@ -5936,9 +6011,9 @@ def get_icu19_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """ICU-19: 48h 内肠内营养(EN)启动率。"""
     from datetime import datetime as dt, timedelta
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     result = {"den_count": 0, "num_count": 0, "den_patients": [], "num_patients": []}
 
     for db_name, db in iter_bed_dbs():
@@ -5965,7 +6040,7 @@ def get_icu19_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 admit = p.get("icuAdmissionTime")
                 if not admit:
                     continue
-                stay_end = p.get("icuDischargeTime") or p.get("dischargeTime") or min(dt.now(), end_dt_wide)
+                stay_end = p.get("icuDischargeTime") or p.get("dischargeTime") or min(dt.utcnow(), end_dt_wide)
                 if stay_end < admit:
                     continue
                 if (stay_end - admit).total_seconds() <= 48 * 3600:
@@ -6077,8 +6152,9 @@ def _day_range(start_time, end_time):
 
     if not start_time or not end_time:
         return
-    day = start_time.date()
-    last_day = end_time.date()
+    # 按北京墙钟日切遍历（存储为 UTC，直接 .date() 会把北京 00-08 点事件归错日）
+    day = to_bj_naive(start_time).date()
+    last_day = to_bj_naive(end_time).date()
     while day <= last_day:
         yield day
         day += timedelta(days=1)
@@ -6216,7 +6292,7 @@ def _ventilator_days(db, pat_by_pid: dict, start_dt, end_dt_wide) -> tuple[int, 
         pid = doc.get("pid")
         if not t or not pid:
             continue
-        key = (pid, t.date())
+        key = (pid, to_bj_naive(t).date())
         if key in day_rows:
             continue
         patient = pat_by_pid.get(pid, {})
@@ -6224,7 +6300,7 @@ def _ventilator_days(db, pat_by_pid: dict, start_dt, end_dt_wide) -> tuple[int, 
         item.update({
             "device_type": "有创呼吸机",
             "device_value": doc.get("strVal", ""),
-            "device_day": t.strftime("%Y-%m-%d"),
+            "device_day": fmt_bj(t, "%Y-%m-%d"),
             "record_time": t,
             "basis": "当日氧疗途径为有创机械通气",
         })
@@ -6372,9 +6448,9 @@ def get_tri_tube_infection_data(code: str, dept_codes: list, start_date: str, en
     from datetime import datetime as dt
 
     cfg = TRI_TUBE_CONFIG[code]
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     result = {
         "num_count": 0,
         "den_count": 0,
@@ -6745,9 +6821,9 @@ def get_sepsis_alert_warnings(dept_codes: list, start_date: str, end_date: str, 
     from ai_analyzer import classify_sepsis_alert_with_ai
     from datetime import datetime as dt
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     warnings = []
 
     for db_name, db in iter_bed_dbs():
@@ -6896,9 +6972,9 @@ def get_tri_tube_suspected_warnings(dept_codes: list, start_date: str, end_date:
     from datetime import datetime as dt
     from collections import defaultdict
 
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
-    end_dt_wide = dt(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
     warnings = []
 
     for db_name, db in iter_bed_dbs():
@@ -6999,9 +7075,9 @@ def get_patient_census(dept_codes: list, start_date: str, end_date: str,
     total(同期患者总数) = carry_in + new_admit
     distinct_by: "admission"=按住院次(patient文档) / "patient"=按 mrn 去重
     """
-    start_dt = datetime.fromisoformat(start_date)
-    end_dt = datetime.fromisoformat(end_date)
-    end_wide = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_wide = utc_day_end_wide(end_date)
     base = {"deptCode": {"$in": dept_codes}, "status": {"$ne": "invalid"}}
     open_ = [{"icuDischargeTime": None}, {"icuDischargeTime": {"$exists": False}}]
 
@@ -7032,10 +7108,11 @@ def get_patient_census_detail(dept_codes: list, start_date: str, end_date: str,
     """
     返回指定 part 的患者明细列表。
     part: carry_in / new_admit / discharge / carry_out (carry_out = carry_in + new_admit - discharge 中仍在科的)
+          / total (分母口径：同期患者总数 = 原有 + 新入，与 get_patient_census 的 total 同口径)
     """
-    start_dt = datetime.fromisoformat(start_date)
-    end_dt = datetime.fromisoformat(end_date)
-    end_wide = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
+    end_wide = utc_day_end_wide(end_date)
     base = {"deptCode": {"$in": dept_codes}, "status": {"$ne": "invalid"}}
     open_ = [{"icuDischargeTime": None}, {"icuDischargeTime": {"$exists": False}}]
 
@@ -7058,12 +7135,20 @@ def get_patient_census_detail(dept_codes: list, start_date: str, end_date: str,
             elif part == "carry_out":
                 q = q_carry_in
                 patient_type = None  # 需要排除出科的
+            elif part == "total":
+                q = None  # 原有 + 新入 两组查询后拼接，patient_type 逐患者标注
+                patient_type = None
             else:
                 return []
 
             fields = {"_id": 1, "mrn": 1, "name": 1, "hisBed": 1,
                       "icuAdmissionTime": 1, "icuDischargeTime": 1}
-            docs = list(db.patient.find(q, fields))
+            if part == "total":
+                # carry_in(入科<月初) 与 new_admit(入科>=月初) 按入科时间互斥，直接拼接无重复
+                docs = list(db.patient.find(q_carry_in, fields)) + \
+                       list(db.patient.find(q_new, fields))
+            else:
+                docs = list(db.patient.find(q, fields))
             if part == "carry_out":
                 docs = [d for d in docs
                         if not d.get("icuDischargeTime") or d["icuDischargeTime"] >= start_dt]
@@ -7076,14 +7161,18 @@ def get_patient_census_detail(dept_codes: list, start_date: str, end_date: str,
                 if admit:
                     ref = discharge or datetime.utcnow()
                     los = (ref - admit).days
+                if part == "total":
+                    ptype = "原有" if (admit and admit < start_dt) else "新入"
+                else:
+                    ptype = patient_type or ("原有" if part == "carry_out" else "")
                 results.append({
                     "patient_id": str(d.get("_id", "")),
                     "mrn": d.get("mrn", ""),
                     "name": d.get("name", ""),
                     "hisBed": d.get("hisBed", ""),
-                    "icuAdmissionTime": admit.isoformat() if admit else "",
-                    "icuDischargeTime": discharge.isoformat() if discharge else "",
-                    "patient_type": patient_type or ("原有" if part == "carry_out" else ""),
+                    "icuAdmissionTime": fmt_bj(admit) if admit else "",
+                    "icuDischargeTime": fmt_bj(discharge) if discharge else "",
+                    "patient_type": ptype,
                     "los_days": los,
                 })
             return results
@@ -7183,6 +7272,11 @@ def get_infection_site(pid: str) -> list:
             {"pid": pid},
             {"_id": 0},
         ).sort("created_at", -1))
+        # 展示字段：存储为 UTC → 转北京墙钟
+        for d in docs:
+            for k in ("eval_time", "created_at", "confirmed_at"):
+                if isinstance(d.get(k), datetime):
+                    d[k] = to_bj_naive(d[k])
         return docs
     except Exception:
         return []
@@ -7296,6 +7390,10 @@ def get_overrides(pid: str, level: str = None) -> list:
         docs = list(sc.icu_manual_override.find(
             query, {"_id": 0}
         ).sort("created_at", -1))
+        # 展示字段：存储为 UTC → 转北京墙钟（前端 new Date 按本地=北京解析）
+        for d in docs:
+            if isinstance(d.get("created_at"), datetime):
+                d["created_at"] = to_bj_naive(d["created_at"])
         return docs
     except Exception:
         return []
@@ -7380,13 +7478,13 @@ def get_override_stats(dept_codes: list, start_date: str, end_date: str) -> dict
         return {"total_overrides": 0, "by_level": {}, "by_reason": {}}
 
     from datetime import datetime as dt
-    start_dt = dt.fromisoformat(start_date)
-    end_dt = dt.fromisoformat(end_date)
+    start_dt = utc_day_start(start_date)
+    end_dt = utc_day_start(end_date)
 
     try:
         pipeline = [
             {"$match": {
-                "created_at": {"$gte": start_dt, "$lte": end_dt},
+                "created_at": {"$gte": start_dt, "$lte": utc_day_end_wide(end_date)},
             }},
             {"$group": {
                 "_id": {"level": "$level", "reason": "$reason_code"},

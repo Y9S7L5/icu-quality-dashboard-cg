@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-人数口径落地：重建 ICU-04/07/09/10 的汇总 + 明细缓存。
+人数口径落地：重建 ICU-04-01/07/09/10 的汇总 + 明细缓存。
 
 背景：INDICATORS_CONFIG 里这四个指标的分子分母定义都是「患者数」，
      而 SmartCare patient 表一行 = 一次 ICU 入住，此前 len() 得到的是人次。
@@ -18,7 +18,7 @@ from db import get_client, BED_DB_NAMES
 import main as m
 from summary import rebuild_summary, SUMMARY_COLLECTION
 
-IND = ["ICU-04", "ICU-07", "ICU-09", "ICU-10"]
+IND = ["ICU-04-01", "ICU-07", "ICU-09", "ICU-10"]
 ap = argparse.ArgumentParser()
 ap.add_argument("--summary-only", action="store_true")
 ap.add_argument("--detail-only", action="store_true")

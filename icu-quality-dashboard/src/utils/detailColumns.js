@@ -141,8 +141,9 @@ function resolveCol5Header(code, part) {
   if (isStaffCode(code)) return '人数'
   if (code === 'ICU-08' && part === 'denominator') return 'P/F值'
   if (code === 'ICU-08' && part === 'numerator') return '俯卧总次数'
-  if (code === 'ICU-04' && part === 'numerator') return 'APACHEⅡ'
-  if (code === 'ICU-04' && part === 'denominator') return '在科'
+  if (code === 'ICU-04-01' && part === 'numerator') return 'APACHEⅡ'
+  if (code === 'ICU-04-01' && part === 'denominator') return '首次APACHEⅡ'
+  if (part === 'denominator' && /^ICU-04-0[2-7]$/.test(code)) return '首次APACHEⅡ'
   if (code === 'ICU-01' && part === 'numerator') return '在床天数'
   if (code === 'ICU-06' && part === 'denominator') return '给药次数'
   if (code === 'ICU-07' && part === 'numerator') return '医嘱条数'
@@ -151,14 +152,36 @@ function resolveCol5Header(code, part) {
   return '数值'
 }
 
+// 分母 = 同期ICU患者总数（人次口径）的指标：明细需区分 原有/新入/出科/未评，
+// 与 DetailModal.vue 的 TYPE_FILTER_CODES 一一对应
+const TYPE_TAG_CODES = [
+  'ICU-04-01', 'ICU-04-02', 'ICU-04-03', 'ICU-04-04', 'ICU-04-05',
+  'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10',
+]
+
+// 分母状态列表头：评估/评分类 → 评估状态(未评/已评)；DVT → 预防状态(未预防/已预防)
+function evalStatusHeader(code) {
+  return code === 'ICU-07' ? '预防状态' : '评估状态'
+}
+
 function resolveDefaultCols(code, part) {
-  return [
+  const base = [
     { header: resolveCol3Header(code, part), get: (p) => fmtText(p.bed_no) },
     { header: resolveCol4Header(code, part), get: (p) => fmtDate(p.admit_time) },
     { header: '入科类型', get: (p) => fmtText(p.admission_type) },
     { header: '出科类型', get: (p) => fmtText(p.discharge_type) },
     { header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') },
   ]
+  if (!TYPE_TAG_CODES.includes(code)) return base
+  // 患者类型(原有/新入)、出科时间；分母再加 未评/已评（07 为 未预防/已预防）
+  base.splice(4, 0,
+    { header: '出科时间', get: (p) => fmtDate(p.discharge_time) || '/' },
+    { header: '患者类型', get: (p) => fmtText(p.patient_type || '/') },
+  )
+  if (part === 'denominator') {
+    base.push({ header: evalStatusHeader(code), get: (p) => fmtText(p.eval_status || '/') })
+  }
+  return base
 }
 
 /* ============================================================
@@ -467,6 +490,8 @@ function buildColumns(code, part, opts = {}) {
       { header: '评分中文名', get: (p) => fmtText(p.dept) },
       { header: '分值',       get: (p) => fmtText(p.value ?? '—') },
       { header: '评估时间',   get: (p) => fmtDate(p.admit_time) },
+      { header: '出科时间',   get: (p) => fmtDate(p.discharge_time) || '/' },
+      { header: '患者类型',   get: (p) => fmtText(p.patient_type || '/') },
     ]
   }
 
