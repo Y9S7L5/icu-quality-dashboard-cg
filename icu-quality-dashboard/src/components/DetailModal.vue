@@ -1,5 +1,5 @@
 <template>
-  <div>
+  <div class="dm-root">
     <!-- P2: 公式条 + 人群漏斗（点击可切换列表/筛选） -->
     <div v-if="summary || funnel" class="formula-row">
       <div class="formula-bar" v-if="summary">
@@ -505,6 +505,8 @@ const rowClass = (p) => {
 };
 </script>
 <style scoped>
+/* 根容器：作为 modal-body 的弹性子项，把弹窗高度约束传递给下方表格区 */
+.dm-root { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
 .source {
   display:flex; align-items:center; justify-content:space-between; gap:12px;
   font-size:13px; color:var(--text-sub); margin-bottom:14px; padding:10px 12px;
@@ -631,10 +633,14 @@ const rowClass = (p) => {
 .detail-table-wrap {
   border: 1px solid #b0c4f0;
   border-radius: 4px;
-  overflow-x: auto;
   background: #fff;
   box-shadow: none;
   margin-top: 6px;
+  /* 弹性占满弹窗剩余高度：行多时表格区内部纵向滚动，
+     横向滚动条固定在弹窗可视区底部，无需拉到表格最下方 */
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow: auto;
 }
 .detail-table { width:100%; border-collapse:collapse; border-spacing:0; }
 .detail-table th {

@@ -7,6 +7,9 @@
         <span class="info-name">{{ patient.name || '—' }}</span>
         <span class="info-mrn">住院号: {{ patient.patient_id || '—' }}</span>
         <span class="info-type" v-if="patient.admission_type">入科类型: {{ patient.admission_type }}</span>
+        <span class="info-type" v-if="patient.discharge_type">出科类型: {{ patient.discharge_type }}</span>
+        <span class="info-type" v-if="patient.icu_out_time">出科时间: {{ patient.icu_out_time }}</span>
+        <span class="info-type" v-if="patient.bed_physician">主治医生: {{ patient.bed_physician }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">📋 入科诊断:</span>
@@ -695,7 +698,7 @@ function lacRowClass(lac) {
   border-radius: 8px;
   padding: 12px 16px;
 }
-.lactate-table-wrap { overflow-x: auto; }
+.lactate-table-wrap { overflow: auto; max-height: 320px; }
 .lactate-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
 .lactate-table th {
   background: #CBD7F5; color: #1f2a44; font-weight: 600;

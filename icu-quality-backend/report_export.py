@@ -174,7 +174,7 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
                         if _is_carry_in(s.get("icuAdmissionTime"), start_dt))
         vals["23.1"], vals["23.2"] = dvt_carry, len(ns) - dvt_carry
         vals["24"] = sum(1 for s in ns if s.get("measure") == "药物预防")
-        vals["25"] = sum(1 for s in ns if s.get("measure") == "机械预防")
+        vals["25"] = sum(1 for s in ns if s.get("measure") == "物理预防")
         drug = {x.get("mrn") for x in dvt.get("drug_patients") or []}
         mech = {x.get("mrn") for x in dvt.get("mech_patients") or []}
         filt = {x.get("mrn") for x in dvt.get("filter_patients") or []}

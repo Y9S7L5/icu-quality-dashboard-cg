@@ -48,6 +48,11 @@ CG_ORDER_KEYWORDS = {
 # 影响: cg 变体分母的确诊时间（diagnosisTime）
 CG_CONFIRM_DIAG_KEYWORDS = ("脓毒血症", "败血症", "感染性休克")
 
+# ---- cg 简化口径 (2026-10): 感染性休克 Bundle 分母诊断关键词 ----
+# 仅这两个词；与 CG_CONFIRM_DIAG_KEYWORDS（旧确诊时间口径）刻意不同，禁止混用
+# 影响: BUNDLE_HOSPITAL_VARIANT=cg 时 ICU-05-1h/3h/6h 分母
+CG_SHOCK_DIAG_KEYWORDS = ("脓毒性休克", "感染性休克")
+
 
 # ---- 分母锚点 ----
 # t0 = 以 T0（第一条医嘱 orderTime）所在月份归属；diagnosis_time = 以诊断时间归属

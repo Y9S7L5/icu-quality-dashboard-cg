@@ -1,5 +1,6 @@
 /* style.css — 全局基础（被 theme.css 覆盖） */
-#app { width: 100vw; min-height: 100vh; }
+/* width 用 100% 而非 100vw：100vw 包含滚动条宽度，页面出现纵向滚动条时会把 #app 撑宽，引发多余的横向滚动条 */
+#app { width: 100%; min-height: 100vh; }
 /* 数字等宽，避免跳动 */
 .tabular-nums,
 strong, .kpi-card-big, .kpi-value span, .census-kpi strong, .bundle-item strong {

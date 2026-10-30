@@ -13,7 +13,7 @@ export const DEFAULT_STATUS_META = {
 
 export const INDICATORS = [
   {
-    code: 'ICU-00', name: '患者动态（原有/新入）', type: 'ratio', unit: '%',
+    code: 'ICU-00', name: 'ICU-患者动态', type: 'ratio', unit: '%',
     numerator: '期初原有患者数', denominator: '同期患者总数（原有+新入）',
     multiplier: 100, direction: 'range',
     thresholds: { good: [0, 100], warn: [0, 100] }, // 结构指标，不做达标判定
@@ -139,7 +139,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-08', name: '中重度ARDS俯卧位通气实施率', type: 'ratio', unit: '%',
-    numerator: '实施俯卧位通气人数', denominator: '应实施人数(PEEP≥5,P/F<150)',
+    numerator: '实施俯卧位通气人数', denominator: '同期ARDS患者数(诊断含呼吸窘迫综合征/ARDS)',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [80, 100], warn: [60, 100] },
     meaning: '反映ARDS规范治疗', chart: 'gauge',
@@ -218,7 +218,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-18', displayCode: 'ICU-19', name: '急性脑损伤意识评估率', type: 'ratio', unit: '%',
-    numerator: '完成意识评估患者数(GCS/FOUR)', denominator: '急性脑损伤患者总数',
+    numerator: '完成意识评估患者数(有APACHEⅡ评分即视为已评估GCS)', denominator: '急性脑损伤患者总数',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [90, 100], warn: [70, 100] },
     meaning: '反映脑损伤患者评估规范性', chart: 'gauge',

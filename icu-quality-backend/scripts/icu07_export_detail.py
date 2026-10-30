@@ -75,8 +75,10 @@ assert len(num_stays) == num_pat, \
 #    且从不与分母队列求交 —— 这正是分子分母不同源的问题。
 # ============================================================
 dc = get_datacenter_db()
-# 修复前的机械预防关键词表（不含本次新增的「气压治疗」）
-OLD_MECH_KEYWORDS = [k for k in MECH_DVT_KEYWORDS if k != "气压治疗"]
+# 历次修复新增的物理预防关键词（修复前词表不含它们，对账基准须同样排除）
+ADDED_MECH_KEYWORDS = ["气压治疗", "运动功能训练"]
+# 修复前的物理预防关键词表
+OLD_MECH_KEYWORDS = [k for k in MECH_DVT_KEYWORDS if k not in ADDED_MECH_KEYWORDS]
 
 
 def old_numerator():
@@ -170,13 +172,13 @@ for o in orders_all:
         "exe": o.get("exeMethod") or "", "lab": bool(lab_re.search(nm)),
     })
 
-# 纯“气压治疗”才命中机械预防的医嘱（旧关键词表里没有它）
+# 完全靠历次新增关键词才命中物理预防的医嘱（旧关键词表里没有它们）
 mech_kw_re = re.compile(
-    _keyword_regex([k for k in MECH_DVT_KEYWORDS if k != "气压治疗"]), re.I)
+    _keyword_regex([k for k in MECH_DVT_KEYWORDS if k not in ADDED_MECH_KEYWORDS]), re.I)
 
 
 def only_qiya(mrn):
-    """该患者的机械预防是否完全依赖新增的「气压治疗」关键词。"""
+    """该患者的物理预防是否完全依赖历次修复新增的关键词（气压治疗/运动功能训练）。"""
     has_mech = any(x["kind"] == "mech" for x in orders_by_mrn.get(mrn, []))
     if not has_mech:
         return False
@@ -197,7 +199,7 @@ def delta_reason(mrn):
         return (f"旧口径按 VI_ICU_ZYBR 时间窗过滤被剔除"
                 f"（deptCode={DEPT} 但 ZYBR 的入/出院时间与 {START[:7]} 不重叠）")
     if only_qiya(mrn):
-        return "旧关键词表缺「气压治疗」—— 本院 IPC 收费医嘱，旧口径漏掉机械预防"
+        return "旧关键词表缺「气压治疗/运动功能训练」—— 本院物理预防医嘱，旧口径漏掉"
     return "旧口径用纯医嘱名匹配且分子分母不同源，该患者被连带漏掉"
 
 
@@ -275,9 +277,9 @@ for i, s in enumerate(num_stays, 1):
         "出ICU时间": fmt(dd) or "仍在科",
         "患者类型": "原有" if (ad and ad < S) else "新入",
         "医嘱条数": s.get("order_count", 0),
-        "医嘱示例": " | ".join(s.get("matched_orders", [])[:5]),
+        "医嘱示例": " | ".join(s.get("matched_orders", [])),  # db 已控制≤6条且药物3+物理3两类都露出
         "有药物预防": "是" if any(k in ("drug",) for k in kinds) else "否",
-        "有机械预防": "是" if any(k in ("mech",) for k in kinds) else "否",
+        "有物理预防": "是" if any(k in ("mech",) for k in kinds) else "否",
         "修复前是否分子": "是" if m in old_mrns else "否",
         "差异说明": delta_reason(m) if m in added else "",
     })
@@ -297,7 +299,7 @@ for i, m in enumerate(sorted(den_mrns - num_mrns, key=str), 1):
         "本科室在科次数": len(recs),
         "匹配到的相关医嘱条数": len(orders_by_mrn.get(m, [])),
         "相关医嘱": " | ".join(sorted({x["name"] for x in orders_by_mrn.get(m, [])})[:3]),
-        "原因": ("统计期内无「已执行」状态的 DVT 预防医嘱（药物/机械）"
+        "原因": ("统计期内无「已执行」状态的 DVT 预防医嘱（药物/物理）"
                  if not orders_by_mrn.get(m) else
                  "命中关键词但均被剔除（检验项目/管路维护/非执行状态）"),
         "ZYBR最近科室": zy.get("deptCode", ""),
@@ -425,7 +427,8 @@ summary += [
      "该表每 mrn 只保留最近一次科室记录，转出本科室的患者会被误剔除）"),
     ("剔除的假阳性", "① 检验项目(肝素结合蛋白HBP/降钙素原PCT二联检) "
      "② 管路维护途径(有创压用/封管用/冲管) ③ 血液净化管路抗凝"),
-    ("新增的机械预防", "「气压治疗费 单肢 bid」= 间歇充气加压(IPC)，本院的 IPC 收费医嘱"),
+    ("新增的物理预防", "①「气压治疗费 单肢 bid」= 间歇充气加压(IPC)，本院的 IPC 收费医嘱 "
+                    "②「运动功能训练」= 早期运动训练（院方口径 2026-10）"),
     ("比率口径", "分子分母均按「人数」（按 mrn 去重的患者数）—— 与 INDICATORS_CONFIG "
      "中 ICU-04/07/09/10「患者数」的定义一致；同一患者当月多次入科只算一人"),
 ]

@@ -668,9 +668,13 @@ window.addEventListener('status-config-updated', () => {
 .toast-fade-leave-active { transition:all .25s ease-in; }
 .toast-fade-enter-from, .toast-fade-leave-to { opacity:0; transform: translateY(12px); }
 
+/* 表格区自身限高滚动：sticky 表头/冻结列相对最近的滚动祖先生效，
+   table-wrap 必须是可滚动容器（overflow:hidden 会让 sticky 永远失效，表头随页面滚走）。
+   高度预算：顶栏56 + 页面上下padding40 + 筛选条约53 + 患者动态条约68 + 底部留白11 ≈ 248，
+   取 240+留白，保证内容不超出视口（否则 window 出滚动条，100vw 还会连锁出横向滚动条） */
 .table-wrap { width:fit-content; max-width:100%; margin:0 auto; background:#fff;
-  border:1px solid #b0c4f0; border-radius:4px; overflow:hidden; box-shadow:none; }
-.table-wrap.multi-month { width:fit-content; max-width:100%; margin:0 auto; overflow-x:auto; }
+  border:1px solid #b0c4f0; border-radius:4px; box-shadow:none;
+  max-height:calc(100vh - 248px); overflow:auto; }
 
 .indi-table { width:auto; table-layout:fixed; border-collapse:collapse; border-spacing:0; }
 .table-wrap.multi-month .indi-table { width:auto; min-width:unset; }

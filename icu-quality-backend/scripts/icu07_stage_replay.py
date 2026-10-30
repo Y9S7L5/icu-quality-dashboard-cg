@@ -56,10 +56,10 @@ def run(label, mech_keywords, classify_fn):
     r = db.get_dvt_prevention_patients(DEPT, S, E)
     n_rec, n_pat = r.get("all_stay_count", 0), r.get("all_count", 0)
     ms = r.get("num_stays", [])
-    mech = len({s["mrn"] for s in ms if "机械" in s.get("measure", "")})
+    mech = len({s["mrn"] for s in ms if "物理" in s.get("measure", "")})
     drug = len({s["mrn"] for s in ms if "药物" in s.get("measure", "")})
     print(f"{label}")
-    print(f"   分子 {n_rec} 人次 / {n_pat} 人   机械预防 {mech} 人 / 药物预防 {drug} 人"
+    print(f"   分子 {n_rec} 人次 / {n_pat} 人   物理预防 {mech} 人 / 药物预防 {drug} 人"
           f"   →  {n_rec / den_rec * 100:.2f}%  (人次)  "
           f"{n_pat / den_pat * 100:.2f}%  (人数)")
     return n_rec, n_pat

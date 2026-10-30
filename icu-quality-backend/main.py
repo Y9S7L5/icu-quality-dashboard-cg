@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from datetime import date, datetime, timedelta
 from tzutil import as_utc, fmt_bj, to_bj_naive, utc_day_start, utc_day_end_wide
 from ai_analyzer import analyze, get_all_ai_decisions, override_ai_decision, ensure_ai_cache_collection as ensure_ai_cache
-from db import assert_db_ready, get_open_bed_count, get_occupied_bed_days, get_staff_count, get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, judge_bundle_v3_for_patient, get_icu08_data, get_icu06_data, get_icu09_data, get_icu10_data, get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data, get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data, get_tri_tube_suspected_warnings, get_sepsis_alert_warnings, confirm_tri_tube_warning, get_dvt_prevention_patients, get_client, BED_DB_NAMES, PROFESSION_CN, get_patient_census, get_patient_census_detail, iter_bed_dbs, resolve_bundle_dc_pid
+from db import assert_db_ready, get_open_bed_count, get_open_bed_days, get_occupied_bed_days, get_staff_count, get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, judge_bundle_v3_for_patient, get_icu08_data, get_icu06_data, get_icu09_data, get_icu10_data, get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data, get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data, get_tri_tube_suspected_warnings, get_sepsis_alert_warnings, confirm_tri_tube_warning, get_dvt_prevention_patients, get_client, BED_DB_NAMES, get_patient_census, get_patient_census_detail, iter_bed_dbs, resolve_bundle_dc_pid
 import random
 import os
 import sys
@@ -242,7 +242,25 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 22  # v11: ICU-07 口径修复(分母队列反查pid/剔假匹配/气压治疗)
+CACHE_VERSION = 32  # v26: ICU-05 cg 简化口径——分母=diagnosisHistoryList 命中
+                    #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
+                    #      (ICU血气/细菌培养/血培养鉴定/抗生素,6h 窗另需血气复查≥2)
+                    #      旧明细(三道门口径)作废
+                    # v27: 全指标明细补 出科类型/出科时间/主治医生(patient.bedPhysician)
+                    #      —— _enrich_admission_discharge 批量补 bed_physician、
+                    #      icu_out_time；旧明细缓存无新字段，作废重算
+                    # v28: ICU-05 cg 分母二关——先 clinicalDiagnosis 命中两关键词，
+                    #      再按月归属：有 diagnosisHistoryList 照旧(月内命中)，
+                    #      无则按 icuAdmissionTime 归月
+                    # v29: ICU-05 cg 分子窗口改为在科期间[入科,出科]——不再限定
+                    #      入科后 1/3/6h；6h 仍需在科期间血气≥2(复查)；旧明细作废
+                    # v30: ICU-07 物理预防补「运动功能训练」关键词(院方口径 2026-10)，
+                    #      明细 measure「机械预防/药物+机械」→「物理预防/药物+物理」
+                    # v31: ICU-18 分子改「有 apacheII 评分即视为 GCS 已评估」——
+                    #      不再查 GCS/FOUR 床旁/量表记录；ICU-18 明细作废重算
+                    # v32: ICU-07 医嘱示例两类都露出——matched_orders 改药物≤3+物理≤3，
+                    #      页面示例列药物+物理拼接两条代表（sample_drug/sample_mech）
+                    # v12: ICU-01 口径修复(分母 bedRecord 逐日床日/分子过0点+6h规则)
                     # v12: ICU-07 明细统一住院号=mrn + detail_id=在科记录_id(分子分母可逐行对账)
                     # v13: ICU-04-01/07/09/10 统一**人数口径**(按 mrn 去重，
                     #      与 INDICATORS_CONFIG「患者数」定义一致；明细一人一行)
@@ -269,6 +287,11 @@ CACHE_VERSION = 22  # v11: ICU-07 口径修复(分母队列反查pid/剔假匹�
                     #      前端可按 原有/新入/出科/未评 筛选；旧明细缓存作废
                     # v22: ICU-04 分母明细 value 改为首次 APACHEⅡ 分值(原恒 1)，
                     #      口径文案改人次口径——核对 分子(≥15)+ICU-04-02分子+未评=分母
+                    # v24: ICU-02/03 分子剔除 行政职能职位(StandardizedDoctor=医务部、
+                    #      StandardizedNurse=护理部)，职位中文名改读库内 professionsTable
+                    # v25: ICU-08 改诊断口径——分母=同期在科且 clinicalDiagnosis 含
+                    #      「呼吸窘迫综合征/ARDS」的患者(不再三闸门 P/F+PEEP+氧疗途径)，
+                    #      分子=统计月∩住院窗口内 param_TiWei 俯卧位记录；旧明细作废
 
 
 def _dept_cache_key(dept_codes: list) -> str:
@@ -568,6 +591,8 @@ def _resolve_dept_codes(icu_unit: str) -> list:
 
 # 19个质控指标的元数据与中文映射
 INDICATORS_CONFIG = {
+    # ICU-00 为患者动态结构指标（不做达标判定，good/warn 全开；前端 excludeFromAlert）
+    "ICU-00": {"name": "ICU-患者动态", "unit": "%", "good": (0, 999), "warn": (0, 999), "dir": "range"},
     "ICU-01": {"name": "ICU床位使用率", "unit": "%", "good": (75, 90), "warn": (60, 95), "dir": "range"},
     "ICU-02": {"name": "ICU医师床位比", "unit": ":1", "good": (0.8, 99), "warn": (0.5, 99), "dir": "higher"},
     "ICU-03": {"name": "ICU护士床位比", "unit": ":1", "good": (3.0, 99), "warn": (2.5, 99), "dir": "higher"},
@@ -585,7 +610,7 @@ INDICATORS_CONFIG = {
     "ICU-07": {"name": "DVT预防率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-08": {"name": "中重度ARDS俯卧位通气实施率", "unit": "%", "good": (80, 100), "warn": (60, 100), "dir": "higher",
                "numerator_desc": "住院期间有俯卧位记录的患者数",
-               "denominator_desc": "中重度ARDS患者数(P/F<150且PEEP≥5且有创氧疗途径)"},
+               "denominator_desc": "同期ICU中临床诊断含「呼吸窘迫综合征」或「ARDS」的患者数"},
     "ICU-09": {"name": "ICU镇痛评估率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-10": {"name": "ICU镇静评估率", "unit": "%", "good": (90, 100), "warn": (70, 100), "dir": "higher"},
     "ICU-11": {"name": "ICU患者标化病死指数(SMR)", "unit": "", "good": (0, 1.0), "warn": (0, 1.2), "dir": "lower"},
@@ -621,7 +646,7 @@ SOURCE_DESC = {
     "ICU-05-6h": {"numerator": "6h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-06": {"numerator": "首剂抗菌药前完成病原学送检(培养/镜检/免疫/分子)的患者数", "denominator": "以治疗为目的使用抗菌药的患者数(已剔除围术期/短疗程预防)"},
     "ICU-07": {"numerator": "本次住院期间实施物理或药物DVT预防措施的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-08": {"numerator": "实施俯卧位通气治疗的患者数", "denominator": "满足PEEP≥5且P/F<150的ARDS患者数"},
+    "ICU-08": {"numerator": "分母患者统计月内有俯卧位记录(param_TiWei)的患者数", "denominator": "同期ICU中临床诊断(clinicalDiagnosis)含「呼吸窘迫综合征」或「ARDS」的患者数"},
     "ICU-09": {"numerator": "本次住院期间进行镇痛评分(NRS/CPOT/BPS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-10": {"numerator": "本次住院期间进行镇静评分(RASS/SAS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-11": {"numerator": "实际死亡患者总数", "denominator": "预计死亡概率(SMR公式计算)累计总和"},
@@ -631,7 +656,7 @@ SOURCE_DESC = {
     "ICU-15": {"numerator": "转出ICU后48小时内再次因同一/新发病情收治入ICU的患者数", "denominator": "同期转出ICU的患者总人数"},
     "ICU-16": {"numerator": "新发生呼吸机相关性肺炎(VAP)的例次数", "denominator": "有创呼吸机累计使用总天数"},
     "ICU-17": {"numerator": "新发生中心导管相关血流感染(CRBSI)的例次数", "denominator": "中心血管导管患者-导管日：同一患者同一日存在≥1根中心静脉导管/PICC/中心静脉透析或CRRT通路计1日；动脉导管、PICCO、中长导管等非中心导管不计入；置管日与拔管日均按占用日历日计入"},
-    "ICU-18": {"numerator": "进行意识状态评分(GCS/FOUR)测定的急性脑损伤患者数", "denominator": "同期收治的急性脑损伤患者总数"},
+    "ICU-18": {"numerator": "有APACHEⅡ评分(视为已行意识评估GCS)的急性脑损伤患者数", "denominator": "同期收治的急性脑损伤患者总数"},
     "ICU-19": {"numerator": "入科48小时内启动肠内营养(EN)支持的患者数", "denominator": "同期入住ICU时间超过48小时的患者总数"},
     "CAUTI": {"numerator": "新发生尿管相关感染(CAUTI)的例次数", "denominator": "导尿管留置累计使用总天数"},
 }
@@ -805,45 +830,16 @@ def _ensure_no_data_indicator_rows(rows: list) -> list:
 # ---- ICU-01 分母：从 MongoDB 读取实际开放床位日数 ----
 def get_icu01_bed_days(dept: str, start_date: str, end_date: str) -> int:
     """
-    ICU床位使用率 分母 = 实际开放总床日数（开放床位数 × 统计天数）。
+    ICU床位使用率 分母 = 实际开放总床日数（逐日累计，见 db.get_open_bed_days）。
 
-    优先 bedRecord（deptCode 支持逗号分隔多科室 + time + bedNum），
-    兜底 configBed（统计 hisName 条数）。
+    bedRecord 每条记录的 bedNum 从 time 起生效，统计期内逐日取当日生效值累加
+    （例：9 月 16 张、10-15 起 17 张 → 10 月分母 = 14×16 + 17×17）；
+    无 bedRecord 时兜底 configBed 床位条数 × 天数。
 
-    dept=all 时汇总全部 ICU 科室的床位数，再乘以天数。
+    dept=all 时汇总全部 ICU 科室的开放床日数。
     """
     dept_codes = _resolve_dept_codes(dept)
-
-    # 计算统计天数
-    try:
-        sd = datetime.strptime(start_date, "%Y-%m-%d")
-        ed = datetime.strptime(end_date, "%Y-%m-%d")
-        days = (ed - sd).days + 1
-        if days <= 0:
-            days = 30
-    except Exception:
-        days = 30
-
-    # 汇总各科室床位数
-    total_beds = 0
-    for dc in dept_codes:
-        total_beds += get_open_bed_count(dc, start_date, end_date)
-
-    # 无数据兜底：跨库 configBed 总计
-    if total_beds == 0:
-        for db_name in BED_DB_NAMES:
-            try:
-                db = get_client()[db_name]
-                total_beds = sum(
-                    db.configBed.count_documents({"deptCode": dc})
-                    for dc in dept_codes
-                )
-                if total_beds > 0:
-                    break
-            except Exception:
-                continue
-
-    return total_beds * days
+    return sum(get_open_bed_days(dc, start_date, end_date) for dc in dept_codes)
 
 
 # ---- 辅助数据查询实现 ----
@@ -957,7 +953,7 @@ def query_summary(period: str, icu_unit: str = "all"):
     icu07_num = dvt_data.get("all_count", 0)
     icu07_den = icu04_den  # 分母=同期在科记录（同ICU-04-01，共用 get_icu_denominator_stays）
 
-    # ----- ICU-08：ARDS俯卧位实施率（三闸门分母 + 俯卧位分子）-----
+    # ----- ICU-08：ARDS俯卧位实施率（诊断分母 + 俯卧位分子）-----
     icu08_data = get_icu08_data(dept_codes, start_date, end_date)
     icu08_num = icu08_data["num_count"]
     icu08_den = icu08_data["den_count"]
@@ -1083,7 +1079,11 @@ def query_trend(code: str, year: int, icu_unit: str = "all"):
 
 
 def _enrich_admission_discharge(items, dept_codes):
-    """Batch-add admission_type and discharge_type from patient collection."""
+    """Batch-add admission_type / discharge_type / bed_physician(主治医生) /
+    icu_out_time(出科时间, 北京帧) from patient collection.
+    #fix: 各指标明细统一展示 出科类型/出科时间/主治医生 —— 一次批量查询补齐，
+    不逐指标改 query_detail；icu_out_time 单独成字段，避免覆盖个别指标
+    复用 discharge_time 槽位展示的其他语义（12/13 管道时间、18 评估时间等）。"""
     if not items:
         return items
     mrns = set()
@@ -1099,12 +1099,15 @@ def _enrich_admission_discharge(items, dept_codes):
             db = get_client()[db_name]
             cursor = db.patient.find(
                 {"mrn": {"$in": list(mrns)}},
-                {"mrn": 1, "admissionType": 1, "dischargedType": 1, "_id": 0}
+                {"mrn": 1, "admissionType": 1, "dischargedType": 1,
+                 "bedPhysician": 1, "icuDischargeTime": 1, "_id": 0}
             )
             for d in cursor:
                 lookup[d.get("mrn", "")] = {
                     "admission_type": d.get("admissionType", ""),
                     "discharge_type": d.get("dischargedType", ""),
+                    "bed_physician": (d.get("bedPhysician") or "").strip(),
+                    "icu_out_time": fmt_bj(d.get("icuDischargeTime")),
                 }
             if lookup:
                 break
@@ -1115,6 +1118,8 @@ def _enrich_admission_discharge(items, dept_codes):
         info = lookup.get(str(mid), {})
         it["admission_type"] = info.get("admission_type", "")
         it["discharge_type"] = info.get("discharge_type", "")
+        it["bed_physician"] = info.get("bed_physician", "")
+        it["icu_out_time"] = info.get("icu_out_time", "")
     return items
 
 def _score_cell(v):
@@ -1236,22 +1241,23 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             _enrich_admission_discharge(items, dept_codes)
             return items
         else:
-            # Build pid->exclusion_key map from den_patients
-            _ek_map = {p.get("pid"): p.get("exclusion_key", "") for p in data.get("den_patients", [])}
+            # 分母明细（诊断口径）：显示临床诊断、住院窗口与窗口内俯卧次数
+            _prone_map = {p.get("pid"): p.get("prone_count", 0) for p in data.get("num_patients", [])}
             items = []
             for p in data.get("den_patients", []):
-                flow_v = p.get('flow_val')
-                flow_s = f"  流速: {flow_v}L/min" if flow_v is not None else ""
+                dx = (p.get("diagnosis") or "").strip()
+                if len(dx) > 40:
+                    dx = dx[:40] + "…"
                 items.append({
                     "patient_id": p.get("mrn", ""),
                     "name": p.get("name", ""),
                     "gender": "", "age": "",
-                    "bed_no": f"P/F={p.get('pf_ratio','?')}  PEEP={p.get('peep','?')}",
+                    "bed_no": dx or "-",
                     "dept": "",
-                    "admit_time": f"纳入: {p.get('arm','')}  |  氧疗途径: {p.get('o2_route','?')}{flow_s}",
-                    "discharge_time": fmt_bj(p.get("pf_time")),
+                    "admit_time": f"纳入: {fmt_bj(p.get('icuAdmissionTime'))}",
+                    "discharge_time": fmt_bj(p.get("icuDischargeTime")),
                     "admission_source": "",
-                    "value": round(p.get('pf_ratio', 0), 1) if isinstance(p.get('pf_ratio'), (int, float)) else p.get('pf_ratio', 0),
+                    "value": _prone_map.get(p.get("pid", ""), 0),
                     "exclusion_key": p.get("exclusion_key", ""),
                     "pid_ref": p.get("pid", ""),
                 })
@@ -2095,12 +2101,25 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
     # ---- ICU-07：DVT预防率明细 ----
     if code == "ICU-07":
         data = get_dvt_prevention_patients(dept_codes, start_date, end_date)
+        if not data.get("data_available", True):
+            # 环境性失败：拒绝产出空明细——空列表会被明细缓存固化，
+            # 且分母侧会把全员误标「未预防」。报错让前端显示加载失败
+            raise HTTPException(
+                status_code=503,
+                detail="ICU-07 取数失败：DataCenter 查询异常，本次结果不可用，请稍后重试",
+            )
         if part == "numerator":
             # 人次口径：num_stays 一行一在科记录，行数 == 汇总分子（all_count），
             # 与分母明细同为一行一在科记录，可逐行核对
             items = []
             for s in data.get("num_stays", []):
                 orders = s.get("matched_orders", [])
+                # 医嘱示例：药物+物理的患者两类各留一条代表，避免高频药物独占示例
+                _sd, _sm = s.get("sample_drug", ""), s.get("sample_mech", "")
+                if _sd and _sm:
+                    _ex = f"{_sd[:50]} | {_sm[:50]}"
+                else:
+                    _ex = orders[0][:60] if orders else ""
                 _dis = s.get("icuDischargeTime")
                 items.append({
                     # 「住院号」列与分母明细同为 mrn，分子分母可逐行对上；
@@ -2113,7 +2132,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "gender": "", "age": "",
                     "bed_no": s.get("measure", ""),          # 列头「预防措施」
                     "dept": s.get("deptCode", ""),
-                    "admit_time": orders[0][:60] if orders else "",   # 列头「医嘱示例」
+                    "admit_time": _ex,                      # 列头「医嘱示例」
                     "discharge_time": fmt_bj(_dis),
                     "admission_source": "",
                     "patient_type": "原有" if s.get("icuAdmissionTime") and s.get("icuAdmissionTime") < start_dt else "新入",
@@ -2141,8 +2160,9 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
 
     # ---- ICU-02/03：从 account 表取真实医护人员明细 ----
     if code in ("ICU-02", "ICU-03"):
-        from db import DOCTOR_PROFESSIONS, NURSE_PROFESSIONS
+        from db import DOCTOR_PROFESSIONS, NURSE_PROFESSIONS, get_profession_cn_map
         professions = DOCTOR_PROFESSIONS if code == "ICU-02" else NURSE_PROFESSIONS
+        prof_cn = get_profession_cn_map()
         staff = []
         if part == "numerator":
             for db_name in BED_DB_NAMES:
@@ -2167,7 +2187,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                                 "name": d.get("trueName") or d.get("username", "-"),
                                 "gender": d.get("sex", ""),
                                 "age": "",
-                                "bed_no": PROFESSION_CN.get(d.get("profession", ""), d.get("profession", "")),
+                                "bed_no": prof_cn.get(d.get("profession", ""), d.get("profession", "")),
                                 "dept": d.get("departmentCode", ""),
                                 "admit_time": fmt_bj(d.get("entryTime"), "%Y-%m-%d", default="-"),
                                 "discharge_time": "",
@@ -2235,17 +2255,11 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     discharge_dt = d.get("icuDischargeTime")
                     mrn = d.get("mrn") or d.get("hisPid") or "-"
 
-                    # ICU-01 分子：计算每位患者的在床天数（北京墙钟日切，
-                    # 存储帧 naive=UTC → +8 后取日期）
+                    # ICU-01 分子：每位患者的在床天数——与汇总分子共用
+                    # db.calc_patient_bed_days（过0点+6h口径），明细之和恒等于列表分子
                     if code == "ICU-01" and part == "numerator" and admit_dt:
-                        first_md = to_bj_naive(admit_dt).date() + timedelta(days=1)
-                        if discharge_dt:
-                            last_md = to_bj_naive(discharge_dt).date()
-                        else:
-                            last_md = end_day_d
-                        first = max(first_md, start_day)
-                        last = min(last_md, end_day_d)
-                        bed_days = (last - first).days + 1 if first <= last else 0
+                        from db import calc_patient_bed_days as _pbd
+                        bed_days = _pbd(admit_dt, discharge_dt, start_date, end_date)
                     else:
                         bed_days = d.get("status", "-")
 
@@ -3165,21 +3179,38 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
                  "与 ICU-04-01 同队列；首次评分列显示本次住院首次 APACHEⅡ 分值（未评为 —）"
         )
     elif code in ("ICU-05-1h", "ICU-05-3h", "ICU-05-6h"):
+        from config.bundle_rules import BUNDLE_HOSPITAL_VARIANT
         h = code.split("-")[2]
-        # 人话文案（#设计: 替换原 V3/K1/A1/B3 技术黑话）
-        if part == "numerator":
-            source_desc = (f"分子：{h} 内完成 Bundle 三步的患者 — "
-                           "①乳酸测定 ②先做血培养、再用抗生素 ③液体复苏达标（1h窗有液体即可，3h/6h窗≥1500ml）")
+        if BUNDLE_HOSPITAL_VARIANT == "cg":
+            # cg 简化口径文案（2026-10）
+            if part == "numerator":
+                source_desc = (f"分子：在科期间（入 ICU 至出 ICU）完成四项 — "
+                               "①查血气（医嘱含 ICU血气）②开痰培养（含 细菌培养）"
+                               "③开血培养（含 血培养鉴定）④抗生素执行；"
+                               "不限入科后 1/3/6 小时，做过即可（1h/3h/6h 判定一致）；"
+                               + ("另需在科期间 ICU血气 ≥2 次（复查血气）" if h == "6h"
+                                  else "四项无先后顺序要求"))
+            else:
+                source_desc = ("分母：统计月内 ICU 在科（入出科与当月有交集），且当前诊断 "
+                               "patient.clinicalDiagnosis 含「脓毒性休克/感染性休克」的在科人次；"
+                               "按月归属：有诊断列表 diagnosisHistoryList 的取诊断时间落在当月的条目，"
+                               "无诊断列表的按 icuAdmissionTime（入 ICU 时间）归月；"
+                               "无器官障碍/感染证据/休克确认门控；T0 = icuAdmissionTime")
         else:
-            source_desc = ("分母：入院 24h 内进 ICU、且确诊脓毒性休克的患者 — "
-                           "同时满足 ①器官障碍（氧合/GCS/MAP/升压药任一）②感染证据（诊断/抗感染/病原学送检任一）"
-                           "③乳酸≥2 且在用升压药；T0 = 入科首条医嘱时间")
+            # 人话文案（#设计: 替换原 V3/K1/A1/B3 技术黑话）
+            if part == "numerator":
+                source_desc = (f"分子：{h} 内完成 Bundle 三步的患者 — "
+                               "①乳酸测定 ②先做血培养、再用抗生素 ③液体复苏达标（1h窗有液体即可，3h/6h窗≥1500ml）")
+            else:
+                source_desc = ("分母：入院 24h 内进 ICU、且确诊脓毒性休克的患者 — "
+                               "同时满足 ①器官障碍（氧合/GCS/MAP/升压药任一）②感染证据（诊断/抗感染/病原学送检任一）"
+                               "③乳酸≥2 且在用升压药；T0 = 入科首条医嘱时间")
     elif code == "ICU-06":
         source_desc = (f"分子：来自 VI_ICU_ZYYZ 培养类检验医嘱，首次抗生素前有病原学送检的患者（送检≤首剂时间）" if part == "numerator"
             else f"分母：来自 drugExe 抗菌药执行记录，经三层判定（A感染信号→B围术期→C短疗程→AI灰区）确认治疗目的，已剔除预防性用药")
     elif code == "ICU-07":
         source_desc = ("分子：来自 DataCenter.VI_ICU_ZYYZ，本次住院期间（含入科当月、不只统计月内）"
-                       "已执行的抗凝药或机械预防医嘱"
+                       "已执行的药物预防（肝素等抗凝药）或物理预防（气压治疗、运动功能训练等）医嘱"
                        "（按分母队列 mrn 反查 pid，不经 ZYBR 科室过滤；剔除检验假匹配、"
                        "封管/有创压管路维护、血液净化管路抗凝）" if part == "numerator"
             else "分母：来自 patient 表，统计期内在科记录（deptCode 属本科室、排除 invalid、入出科时间与统计期有交集）。"
@@ -3351,6 +3382,15 @@ def get_bundle_v3_detail(mrn: str, period: str = ""):
     data = get_bundle_data_v2([], start_date, end_date)
     for p in data.get("den_patients", []):
         if p.get("mrn") == mrn:
+            # cg 简化口径: 分母行自带合成 v3（四项窗口判定），直接返回，
+            # 不再重跑 judge_bundle_v3_for_patient（旧三道门结果与新口径矛盾）
+            from config.bundle_rules import BUNDLE_HOSPITAL_VARIANT
+            if BUNDLE_HOSPITAL_VARIANT == "cg" and p.get("v3"):
+                return {"ok": True, "patient": {
+                    "mrn": mrn, "name": p.get("name", ""),
+                    "t0": fmt_bj(p.get("t0")) if p.get("t0") else None,
+                    "diagnose": p.get("diagnose", ""),
+                }, "v3": p["v3"]}
             sc_pid = p.get("sc_pid")
             dc_pid = resolve_bundle_dc_pid(p)
             t0 = p.get("t0")

@@ -562,10 +562,11 @@ LAB_ORDER_TYPES = [s.strip() for s in _env(
 
 def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
     """
-    ICU-01（ICU床位使用率）分母 —— 实际开放床位数。
+    ICU-02/03（医师/护士床位比）分母 —— 统计期末实际开放床位数。
 
     优先级：
-      1. bedRecord 集合：按 deptCode（支持逗号分隔多科室）、time、BedNum 查询
+      1. bedRecord 集合：deptCode（支持逗号分隔多科室）+ time 生效规则，
+         取统计期末之前最近一条记录的 bedNum（例：10 月查询 → 10-15 起的 17 张）
       2. configBed 集合：统计该 deptCode 下的床位数量（hisName 条数）
 
     参数：
@@ -576,8 +577,7 @@ def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
     返回：开放床位数，无数据返回 0
     """
     try:
-        start_dt = utc_day_start(start_date)
-        end_dt = utc_day_start(end_date)
+        end_dt = utc_day_end_wide(end_date)
     except ValueError:
         return 0
 
@@ -586,11 +586,14 @@ def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
 
             # ---- Priority 1: bedRecord ----
             # deptCode 可能是逗号分隔的多科室字段，如 "JJL000283,0801,JJL000282"
-            # 用正则匹配目标 dept_code
-            bed_record = db.bedRecord.find_one({
-                "deptCode": {"$regex": dept_code},
-                "time": {"$gte": start_dt, "$lte": utc_day_end_wide(end_date)},
-            })
+            # time 之前的记录在期末仍生效，故只设上界并取最新一条
+            bed_record = db.bedRecord.find_one(
+                {
+                    "deptCode": {"$regex": dept_code},
+                    "time": {"$lte": end_dt},
+                },
+                sort=[("time", -1)],
+            )
             if bed_record and bed_record.get("bedNum"):
                 return int(bed_record["bedNum"])
 
@@ -602,6 +605,59 @@ def get_open_bed_count(dept_code: str, start_date: str, end_date: str) -> int:
 
         except Exception as _exc:
             logger.warning("DB %s failed in get_open_bed_count: %s", db_name, _exc)
+            continue
+
+    return 0
+
+
+def get_open_bed_days(dept_code: str, start_date: str, end_date: str) -> int:
+    """
+    ICU-01（ICU床位使用率）分母 —— 实际开放总床日数（逐日累计）。
+
+    bedRecord 每条记录的 bedNum 从 time 起生效；统计期内逐日取
+    "当日 23:59:59 前最近一条" 的 bedNum 累加。
+    例：9 月及以前 16 张、10-15 起 17 张 → 10 月分母 = 14×16 + 17×17。
+
+    无 bedRecord 时兜底 configBed 床位条数 × 统计天数。
+    """
+    try:
+        start_day = datetime.fromisoformat(start_date).date()
+        end_day = datetime.fromisoformat(end_date).date()
+    except ValueError:
+        return 0
+    if end_day < start_day:
+        return 0
+    days = (end_day - start_day).days + 1
+
+    for db_name, db in iter_bed_dbs():
+        try:
+            recs = [
+                r for r in db.bedRecord.find(
+                    {"deptCode": {"$regex": dept_code}},
+                    {"time": 1, "bedNum": 1},
+                ).sort("time", 1)
+                if r.get("time") is not None and r.get("bedNum")
+            ]
+            if recs:
+                total = 0
+                ri = -1  # 当前生效记录下标（time 升序，前向扫描）
+                day = start_day
+                while day <= end_day:
+                    day_end = utc_day_end_wide(day.strftime("%Y-%m-%d"))
+                    while ri + 1 < len(recs) and recs[ri + 1]["time"] <= day_end:
+                        ri += 1
+                    if ri >= 0:
+                        total += int(recs[ri]["bedNum"])
+                    day += timedelta(days=1)
+                return total
+
+            # ---- 兜底：configBed ----
+            config_count = db.configBed.count_documents({"deptCode": dept_code})
+            if config_count > 0:
+                return config_count * days
+
+        except Exception as _exc:
+            logger.warning("DB %s failed in get_open_bed_days: %s", db_name, _exc)
             continue
 
     return 0
@@ -622,31 +678,74 @@ def get_all_dept_open_beds(dept_codes: list, start_date: str, end_date: str) -> 
 # ICU-01 分子：实际占用总床日数
 # ============================================================
 
+def calc_patient_bed_days(admit_dt, discharge_dt, start_date: str, end_date: str) -> int:
+    """
+    单患者在统计期内的占用床日（ICU-01 分子口径，2026-10 院方确认）：
+      - 过 0 点计 1 天：患者在北京日 00:00 时仍在 ICU（入科 < 0点 ≤ 出科），该日计 1 床日
+      - 当日入 ICU 当日出院（未跨 0 点）：住满 ≥ 6 小时计 1 床日
+      - 住 ICU 总时长 < 6 小时：不计床日（即使跨了 0 点也不计）
+      - 未出院患者计到统计期末
+
+    汇总（get_occupied_bed_days）与下钻明细（main.query_detail）共用本函数，
+    保证明细逐人床日之和恒等于列表分子。
+    """
+    try:
+        start_day = datetime.fromisoformat(start_date).date()
+        end_day = datetime.fromisoformat(end_date).date()
+    except ValueError:
+        return 0
+    if end_day < start_day or not admit_dt:
+        return 0
+
+    # 统计期边界（UTC 瞬间帧：北京 start_day 00:00 ~ end_day+1 00:00）
+    # 必须 as_utc 归一为 aware：下方与 as_utc(admit/discharge) 做比较/减法，
+    # naive 混 aware 会抛 TypeError，分子会被吞成 0
+    period_start = as_utc(utc_day_start(start_date))
+    period_end_excl = period_start + timedelta(days=(end_day - start_day).days + 1)
+    day_delta = timedelta(days=1)
+    min_los = timedelta(hours=6)
+
+    admit_u = as_utc(admit_dt)
+    discharge_u = as_utc(discharge_dt) if discharge_dt else None
+
+    # 已出院且总时长 < 6h：不计床日
+    if discharge_u is not None and (discharge_u - admit_u) < min_los:
+        return 0
+
+    # 在科区间右端裁剪到统计期末；未出院计到期末
+    hi = min(discharge_u, period_end_excl) if discharge_u else period_end_excl
+
+    # 统计期起点之前已出科：不计。
+    # hi == period_start（出科恰在期初 0 点）按口径「入科 < 0点 ≤ 出科」仍计 1 天，
+    # 故只排除 hi < period_start
+    if hi < period_start:
+        return 0
+
+    # 跨 0 点天数：m 满足 admit < period_start + m*24h <= hi，且 0 <= m <= end_day
+    d_hi = (hi - period_start) // day_delta
+    d_hi = min(d_hi, (end_day - start_day).days)  # 期末次日 0 点不计（hi 裁剪会落到该瞬间）
+    d_lo = (admit_u - period_start) // day_delta  # 可为负（期前入科）
+    first_m = max(0, d_lo + 1)
+    crossed = d_hi - first_m + 1 if d_hi >= first_m else 0
+
+    if crossed > 0:
+        return crossed
+    if discharge_u is not None:
+        # 当日入当日出（≥6h）计 1 天，入科日须落在统计期内
+        bj_day = to_bj_naive(admit_dt).date()
+        if start_day <= bj_day <= end_day:
+            return 1
+    return 0
+
+
 def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int:
     """
     ICU-01（ICU床位使用率）分子 —— 实际占用总床日数。
-
-    定义：统计期内，每日 0 点时刻在 ICU 的患者人数总和。
-
-    逻辑：
-      - 查询 patient 表，条件：
-        deptCode = 目标科室
-        status != 'invalid'
-        icuAdmissionTime <= 统计期末
-        icuDischargeTime >= 统计期始 或 未出院
-      - 对每位患者计算与统计期的日期交集：
-        患者"在科"的午夜范围 = [入科次日0点, 出科当日0点]
-        (入院当日不计，出院当日计入 —— 符合卫生部统计口径)
-      - 与统计期 [start_date, end_date] 取交集，计天数
-
-    返回：占用总床日数，无数据返回 0
+    口径见 calc_patient_bed_days；本函数按科室汇总逐患者床日。
     """
     try:
-        start_dt = utc_day_start(start_date)
-        end_dt = utc_day_start(end_date)
-        # 北京墙钟日历日（床日按北京日切，勿用 UTC 帧的 y/m/d）
-        start_day = datetime.fromisoformat(start_date).date()
-        end_day = datetime.fromisoformat(end_date).date()
+        datetime.fromisoformat(start_date)
+        datetime.fromisoformat(end_date)
     except ValueError:
         return 0
 
@@ -662,7 +761,7 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
                     "status": {"$ne": "invalid"},
                     "icuAdmissionTime": {"$lte": utc_day_end_wide(end_date)},
                     "$or": [
-                        {"icuDischargeTime": {"$gte": start_dt}},
+                        {"icuDischargeTime": {"$gte": utc_day_start(start_date)}},
                         {"icuDischargeTime": None},
                         {"icuDischargeTime": {"$exists": False}},
                     ],
@@ -674,28 +773,11 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
                 continue  # 当前库无数据，尝试下一个
 
             for p in patients:
-                admit_dt: datetime = p.get("icuAdmissionTime")
-                discharge_dt: datetime | None = p.get("icuDischargeTime")
-
-                if not admit_dt:
-                    continue
-
-                # 患者"在科"的日历日范围（按北京墙钟日切，存储为 UTC，见 tzutil）：
-                # 首个在科日 = 入科北京日期的次日（入院当日不计）
-                first_day = to_bj_naive(admit_dt).date() + timedelta(days=1)
-
-                # 末个在科日 = 出科北京日期当日（出院当日计入）
-                if discharge_dt:
-                    last_day = to_bj_naive(discharge_dt).date()
-                else:
-                    last_day = end_day  # 未出院，计到统计期末（北京末日）
-
-                # 与统计期取交集
-                first = max(first_day, start_day)
-                last = min(last_day, end_day)
-
-                if first <= last:
-                    total += (last - first).days + 1
+                total += calc_patient_bed_days(
+                    p.get("icuAdmissionTime"),
+                    p.get("icuDischargeTime"),
+                    start_date, end_date,
+                )
 
             break  # 有数据就不再查下一个库
 
@@ -710,15 +792,19 @@ def get_occupied_bed_days(dept_code: str, start_date: str, end_date: str) -> int
 # ICU-02/03：医师/护士人数（从 account 表读取）
 # ============================================================
 
+# ICU-02/03 分子按职位过滤。注意：本院 professionsTable 中
+# StandardizedDoctor→「医务部」、StandardizedNurse→「护理部」属行政职能，
+# 不计入医师/护士床位比分子。
 DOCTOR_PROFESSIONS = {
     "AttendingDoctor", "DeputyDirector", "Director", "DirectorAssistant",
-    "Doctor", "Intern", "StandardizedDoctor", "StudyDoctor",
+    "Doctor", "Intern", "StudyDoctor",
 }
 NURSE_PROFESSIONS = {
     "Matron", "MatronAssistant", "Nurse", "NurseLeader",
-    "PracticeNurse", "StandardizedNurse", "StudyNurse",
+    "PracticeNurse", "StudyNurse",
 }
 
+# 职位中文名内置兜底（professionsTable 不可用时使用；正常以库内表为准）
 PROFESSION_CN = {
     "AttendingDoctor": "主治医师",
     "DeputyDirector": "副主任医师",
@@ -735,17 +821,49 @@ PROFESSION_CN = {
     "PracticeNurse": "实习护士",
     "StandardizedNurse": "规培护士",
     "StudyNurse": "进修护士",
+    "MedicalRecordRoom": "病案室",
+    "InformationDept": "信息科",
     "Admin": "管理员",
     "SystemAdmin": "系统管理员",
 }
+
+_profession_cn_cache = {"map": None, "ts": 0.0}
+
+
+def get_profession_cn_map(force: bool = False) -> dict:
+    """
+    职位中文名映射：优先读库内 professionsTable 集合（医院可自行维护
+    职位码→中文名，如 StandardizedDoctor→医务部），失败时回退内置
+    PROFESSION_CN。进程内缓存 10 分钟。
+    """
+    import time as _time
+    now = _time.time()
+    if (not force and _profession_cn_cache["map"] is not None
+            and now - _profession_cn_cache["ts"] < 600):
+        return _profession_cn_cache["map"]
+    result = dict(PROFESSION_CN)
+    for db_name, db in iter_bed_dbs():
+        try:
+            for d in db.professionsTable.find(
+                    {}, {"professions": 1, "professionName": 1, "_id": 0}):
+                code, name = d.get("professions"), d.get("professionName")
+                if code and name:
+                    result[code] = name
+            break
+        except Exception as _exc:
+            logger.warning("DB %s failed in get_profession_cn_map: %s", db_name, _exc)
+            continue
+    _profession_cn_cache["map"] = result
+    _profession_cn_cache["ts"] = now
+    return result
 
 
 def get_staff_count(dept_code: str, role: str) -> int:
     """
     从 account 表统计某科室的医师或护士人数。
 
-    role: 'doctor' → 统计 Doctor + Director
-          'nurse'  → 统计 Nurse + NurseLeader + Matron
+    role: 'doctor' → DOCTOR_PROFESSIONS（不含医务部/StandardizedDoctor）
+          'nurse'  → NURSE_PROFESSIONS（不含护理部/StandardizedNurse）
 
     参数 dept_code 支持逗号分隔多科室字段的 regex 匹配。
     """
@@ -1331,6 +1449,12 @@ def get_bundle_data_v2(dept_codes: list, start_date: str, end_date: str) -> dict
             "den_patients": [...],
         }
     """
+    # cg 简化口径（2026-10）: 分母=诊断列表命中, 分母/分子全走 bundle_cg，
+    # 短路本函数的候选收集 + v3 三道门链路；default 变体不经过此处。
+    if BUNDLE_HOSPITAL_VARIANT == "cg":
+        from scoring.bundle_cg import get_bundle_data_cg
+        return get_bundle_data_cg(dept_codes, start_date, end_date)
+
     from datetime import datetime as dt, timedelta
 
     start_dt = utc_day_start(start_date)
@@ -1807,222 +1931,124 @@ def is_invasive_by_o2route(raw_route: str) -> tuple:
 
 
 # ============================================================
-# ICU-08：中重度ARDS俯卧位实施率 分母 — P/F <150 且 PEEP≥5 且有创通气
+# ICU-08：中重度ARDS俯卧位实施率 — 诊断分母 + 俯卧位分子
 # ============================================================
 
-def get_ards_denominator(dept_codes: list, start_date: str, end_date: str,
-                         peep_threshold: float = 5.0, oi_threshold: float = 150.0,
-                         time_tolerance_min: int = 60) -> dict:
+# 分母诊断关键词：patient.clinicalDiagnosis 命中任一即视为 ARDS 患者（不区分大小写）
+ARDS_DIAG_PATTERN = "呼吸窘迫综合征|ARDS"
+
+
+def get_icu08_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
-    ICU-08 分母：中重度ARDS患者（PEEP≥5 且 P/F<150）。
+    ICU-08（中重度ARDS俯卧位通气实施率）分母+分子。
 
-    【取数逻辑】
-    1. 从 bGATemp 表取 code='param_bg_P/Fratio' 且 bedsides.valid='valid' 的血气
-    2. 每条血气按 pid 关联 bedside 表，向前回溯 time_tolerance_min 分钟找最近一条
-       code='param_vent_peep' 且 valid=true 的 PEEP 记录（不向后取值）
-    3. 配对后判定：strVal≥peep_threshold 且 fVal<oi_threshold
-    4. 同一 pid 在统计期内首次满足条件即纳入分母
+    分母：同期 ICU 在科患者中，patient.clinicalDiagnosis 包含
+          "呼吸窘迫综合征" 或 "ARDS" 的患者（不区分大小写）。
+          同期口径与 get_icu_denominator_stays 一致：
+          icuAdmissionTime <= 期末 且 (icuDischargeTime >= 期初 或 未出科)。
 
-    关联字段：
-      bGATemp.eventExe.pid == bedside.pid  (patient ObjectId)
-      bGATemp → patient._id 关联获取 deptCode/mrn
+    分子：分母患者在 [统计月 ∩ 本次住院] 窗口内存在
+          bedside code=param_TiWei、strVal 含"俯卧位"、valid=true 记录的患者数。
 
-    返回: {total, patients: [{pid, mrn, name, pf_ratio, peep, pf_time, peep_time}]}
+    口径说明：SmartCare patient 一行 = 一次 ICU 入住（bedside.pid 按次住院关联），
+    同一患者多次入科按在科记录各计一条，分子分母同队列。
+
+    返回: {den_count, num_count, den_patients, num_patients}
     """
-    from datetime import datetime as dt, timedelta
-    from bson import ObjectId
-
     start_dt = utc_day_start(start_date)
-    end_dt = utc_day_start(end_date)
+    end_dt_wide = utc_day_end_wide(end_date)
 
-    result = {"total": 0, "patients": []}
-    seen_pids = set()
+    den_patients = []
 
     for db_name, db in iter_bed_dbs():
         try:
-
-            # Step 1: 取统计期内的血气 P/F ratio (bGATemp + bGATemp1)
-            all_bga = []
-            for coll_name in ["bGATemp", "bGATemp1"]:
-                try:
-                    bgas = list(db[coll_name].find(
-                        {
-                            "deptCode": {"$in": dept_codes},
-                            "eventExe.startTime": {
-                                "$gte": start_dt,
-                                "$lte": utc_day_end_wide(end_date),
-                            },
-                            "bedsides": {
-                                "$elemMatch": {
-                                    "code": "param_bg_P/Fratio",
-                                    "valid": "valid",
-                                },
-                            },
-                        },
-                        {
-                            "eventExe.pid": 1, "mrn": 1, "deptCode": 1,
-                            "eventExe.startTime": 1, "bedsides": 1,
-                        },
-                    ).sort("eventExe.startTime", 1))
-                    all_bga.extend(bgas)
-                except Exception as _exc:
-                    logger.warning("DB %s failed in get_ards_denominator: %s", db_name, _exc)
-                    continue
-
-            if not all_bga:
-                continue
-
-            # Step 2: 逐条血气尝试配对（同 pid 取首次满足条件的配对）
-            for bga in all_bga:
-                pid = bga["eventExe"]["pid"]
-                if pid in seen_pids:
-                    continue
-
-                pf_time = bga["eventExe"]["startTime"]
-                pf_ratio = None
-                for item in bga.get("bedsides", []):
-                    if item.get("code") == "param_bg_P/Fratio" and item.get("valid") == "valid":
-                        pf_ratio = item.get("fVal")
-                        break
-
-                if pf_ratio is None or pf_ratio >= oi_threshold:
-                    continue
-
-                window_start = pf_time - timedelta(minutes=time_tolerance_min)
-
-                # 就近配对 PEEP
-                peep_doc = db.bedside.find_one(
-                    {
-                        "pid": pid,
-                        "code": "param_vent_peep",
-                        "valid": True,
-                        "time": {"$gte": window_start, "$lte": pf_time},
+            cursor = db.patient.find(
+                {
+                    "deptCode": {"$in": dept_codes},
+                    "status": {"$ne": "invalid"},
+                    "icuAdmissionTime": {"$lte": end_dt_wide},
+                    "$or": [
+                        {"icuDischargeTime": {"$gte": start_dt}},
+                        {"icuDischargeTime": None},
+                        {"icuDischargeTime": {"$exists": False}},
+                    ],
+                    "clinicalDiagnosis": {
+                        "$regex": ARDS_DIAG_PATTERN,
+                        "$options": "i",
                     },
-                    {"strVal": 1, "time": 1},
-                    sort=[("time", -1)],
-                )
-                if not peep_doc:
-                    continue
-
-                try:
-                    peep_val = float(peep_doc.get("strVal", "0"))
-                except (ValueError, TypeError):
-                    continue
-
-                if peep_val < peep_threshold:
-                    continue
-
-                # 查氧疗途径（主判据）
-                o2_doc = db.bedside.find_one(
-                    {
-                        "pid": pid,
-                        "code": "param_XiYangTuJing",
-                        "valid": True,
-                        "time": {"$gte": window_start, "$lte": pf_time},
-                    },
-                    {"strVal": 1, "time": 1},
-                    sort=[("time", -1)],
-                )
-                o2_raw = o2_doc.get("strVal", "") if o2_doc else ""
-                o2_invasive, o2_routes, o2_reason = is_invasive_by_o2route(o2_raw)
-                if not o2_invasive:
-                    continue  # 无创氧疗途径 → 跳过
-
-                # 首次匹配！纳入分母
-                seen_pids.add(pid)
-                pat_name = ""
-                mrn = bga.get("mrn", "")
-                try:
-                    pat = db.patient.find_one(
-                        {"_id": ObjectId(pid)},
-                        {"name": 1, "mrn": 1, "hisBed": 1},
-                    )
-                    if pat:
-                        pat_name = pat.get("name", "")
-                        if not mrn:
-                            mrn = pat.get("mrn", "") or pat.get("hisPid", "")
-                except Exception:
-                    pass
-                result["patients"].append({
+                },
+                {"_id": 1, "mrn": 1, "hisPid": 1, "name": 1, "hisBed": 1,
+                 "clinicalDiagnosis": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1},
+            ).sort("icuAdmissionTime", 1)
+            for pat in cursor:
+                pid = str(pat["_id"])
+                den_patients.append({
                     "pid": pid,
-                    "mrn": mrn,
-                    "name": pat_name,
-                    "pf_ratio": pf_ratio,
-                    "peep": peep_val,
-                    "o2_route": o2_raw,
-                    "o2_reason": o2_reason,
-                    "pf_time": pf_time,
-                    "peep_time": peep_doc.get("time"),
-                    "o2_time": o2_doc.get("time") if o2_doc else None,
+                    "mrn": pat.get("mrn", "") or pat.get("hisPid", ""),
+                    "name": pat.get("name", ""),
+                    "hisBed": pat.get("hisBed", ""),
+                    "diagnosis": pat.get("clinicalDiagnosis", ""),
+                    "icuAdmissionTime": pat.get("icuAdmissionTime"),
+                    "icuDischargeTime": pat.get("icuDischargeTime"),
+                    "exclusion_key": build_exclusion_key(pid, pat.get("icuAdmissionTime")),
                 })
-
-            result["total"] = len(result["patients"])
             break
-
         except Exception as _exc:
-            logger.warning("DB %s failed in get_ards_denominator: %s", db_name, _exc)
+            logger.warning("DB %s failed in get_icu08_data: %s", db_name, _exc)
             continue
 
-    return result
+    logger.info("[ICU-08] window=%s ~ %s dept=%s 诊断口径分母=%d",
+                start_date, end_date, dept_codes, len(den_patients))
+
+    # 分子：统计月 ∩ 住院期 窗口内的俯卧位
+    num_result = get_ards_prone_numerator(den_patients, start_date, end_date)
+
+    # 窗口自检：分子不得大于分母
+    if num_result["num_count"] > len(den_patients):
+        logger.warning("[ICU-08] 分子(%d) 大于 分母(%d),窗口口径异常,已截断",
+                       num_result["num_count"], len(den_patients))
+        num_result["num_count"] = len(den_patients)
+
+    return {
+        "den_count": len(den_patients),
+        "num_count": num_result["num_count"],
+        "den_patients": den_patients,
+        "num_patients": num_result["num_patients"],
+    }
 
 
-def get_ards_prone_numerator(den_patients: list, dept_codes: list,
-                             start_date: str, end_date: str) -> dict:
+def get_ards_prone_numerator(den_patients: list, start_date: str, end_date: str) -> dict:
     """
-    ICU-08 分子：分母患者中，统计月内存在俯卧位记录的患者数。
+    ICU-08 分子：分母患者中，[统计月 ∩ 本次住院] 窗口内存在俯卧位记录的患者数。
 
-    判据：bedside 表 code=param_TiWei, strVal 包含"俯卧位",
-          valid=true, time 落在统计月与住院期的交集窗口内。
+    判据：bedside 表 code=param_TiWei, strVal 含"俯卧位", valid=true,
+          time 落在窗口内。未出科取月末，绝不用 now()。
 
     参数:
-      den_patients: 分母患者列表，每项需含 pid, pf_time 等字段
-      dept_codes: 科室代码列表（预留，当前未使用）
+      den_patients: 分母患者列表（get_icu08_data 产出），
+                    每项含 pid / mrn / name / icuAdmissionTime / icuDischargeTime
       start_date: 统计月起始日期 "YYYY-MM-DD"
       end_date: 统计月结束日期 "YYYY-MM-DD"
 
-    返回: {num_count, num_patients: [{pid, mrn, name, prone_times[]}]}
+    返回: {num_count, num_patients: [{pid, mrn, name, prone_times[], prone_count}]}
     """
-    from datetime import datetime as dt
-    from bson import ObjectId
-
     start_dt = utc_day_start(start_date)
-    end_dt = utc_day_start(end_date)
     end_dt_wide = utc_day_end_wide(end_date)
 
     result = {"num_count": 0, "num_patients": []}
 
     for db_name, db in iter_bed_dbs():
         try:
-
             for p in den_patients:
                 pid = p.get("pid", "")
                 if not pid:
                     continue
 
-                # 查住院区间
-                try:
-                    pat = db.patient.find_one(
-                        {"_id": ObjectId(pid)},
-                        {"icuAdmissionTime": 1, "icuDischargeTime": 1},
-                    )
-                except Exception as _exc:
-                    logger.warning("DB %s failed in get_ards_prone_numerator: %s", db_name, _exc)
-                    continue
-
-                if not pat or not pat.get("icuAdmissionTime"):
-                    continue
-
-                # 使用交集窗口，未出科取月末，绝不用 now()
-                win_start, win_end = _month_window(pat, start_dt, end_dt_wide)
+                # 统计月 ∩ 本次住院 的观察窗口
+                win_start, win_end = _month_window(p, start_dt, end_dt_wide)
                 if win_start > win_end:
                     continue  # 本月不在科
 
-                # 俯卧位是对低氧的临床响应，必须晚于"让这个人进分母的那条血气"
-                pf_time = p.get("pf_time")
-                if isinstance(pf_time, dt):
-                    win_start = max(win_start, pf_time)
-
-                # 查俯卧位记录
                 prone_records = list(db.bedside.find(
                     {
                         "pid": pid,
@@ -2044,191 +2070,12 @@ def get_ards_prone_numerator(den_patients: list, dept_codes: list,
                         "prone_count": len(prone_records),
                         "exclusion_key": p.get("exclusion_key", ""),
                     })
-
             break
         except Exception as _exc:
             logger.warning("DB %s failed in get_ards_prone_numerator: %s", db_name, _exc)
             continue
 
     return result
-
-
-# ============================================================
-# ICU-08 组合：分母+分子一次返回
-# ============================================================
-
-def get_icu08_data(dept_codes: list, start_date: str, end_date: str,
-                   invasive_pf: float = 150.0, noninvasive_pf: float = 200.0,
-                   hfnc_flow_min: float = 30.0, peep_min: float = 5.0,
-                   time_tolerance_min: int = 60) -> dict:
-    """
-    ICU-08（中重度ARDS俯卧位实施率）完整三套分母+分子。
-
-    分母三臂：
-      有创: 氧疗途径∈{管辅,切辅,管氧,切氧,管文,切文,管高,切高} 且 PEEP≥5 且 P/F<150
-      无创: 氧疗途径=无创 且 PEEP≥5 且 P/F≤200
-      高流量: 氧疗途径=高流量 且 吸氧流速≥30L/min 且 P/F≤200
-    三臂按 pid 去重取并集。
-
-    分子：分母患者统计月内有 param_TiWei 含"俯卧位"记录。
-
-    返回: {den_count, num_count, den_patients, num_patients}
-    """
-    from datetime import datetime as dt, timedelta
-    from bson import ObjectId
-    from config.o2_route_map import classify_o2_route
-    from config.indicator_windows import ICU08_PAIR_MODE
-
-    logger.info("[ICU-08] window=%s ~ %s dept=%s", start_date, end_date, dept_codes)
-
-    # 接线 ICU08_PAIR_MODE
-    if ICU08_PAIR_MODE == "locf_8h":
-        time_tolerance_min = 480  # 8h LOCF 窗口
-
-    start_dt = utc_day_start(start_date)
-    end_dt = utc_day_start(end_date)
-    den_patients = []
-    seen_pids = set()
-
-    for db_name, db in iter_bed_dbs():
-        try:
-
-            # Step 1: 取血气 P/F
-            all_bga = []
-            for coll_name in ["bGATemp", "bGATemp1"]:
-                try:
-                    bgas = list(db[coll_name].find(
-                        {"deptCode": {"$in": dept_codes},
-                         "eventExe.startTime": {"$gte": start_dt, "$lte": utc_day_end_wide(end_date)},
-                         "bedsides": {"$elemMatch": {"code": {"$in": ["param_bg_P/Fratio", "param_bg_OI", "param_bg_po2"]}, "valid": "valid"}}},
-                        {"eventExe.pid": 1, "eventExe.startTime": 1, "bedsides": 1, "mrn": 1},
-                    ).sort("eventExe.startTime", 1))
-                    all_bga.extend(bgas)
-                except Exception as _exc:
-                    logger.warning("DB %s failed in get_icu08_data: %s", db_name, _exc)
-                    continue
-
-            for bga in all_bga:
-                pid = bga["eventExe"]["pid"]
-                if pid in seen_pids:
-                    continue
-                pf_time = bga["eventExe"]["startTime"]
-                pf_ratio = None
-                pf_ratio = _pf_ratio_from_bedsides(bga.get("bedsides", []))
-                if pf_ratio is None:
-                    continue
-
-                win = pf_time - timedelta(minutes=time_tolerance_min)
-
-                # 氧疗途径 → o2_route_map 分类
-                o2_doc = db.bedside.find_one(
-                    {"pid": pid, "code": "param_XiYangTuJing", "valid": True,
-                     "time": {"$gte": win, "$lte": pf_time}},
-                    {"strVal": 1}, sort=[("time", -1)])
-                o2_raw = o2_doc.get("strVal", "") if o2_doc else ""
-                o2_cls = classify_o2_route(o2_raw)
-                icu08_arm = o2_cls["icu08_arm"]  # invasive/noninvasive/hfnc/none/unknown
-
-                # PEEP — 仅 invasive 和 noninvasive 臂需要
-                # 需求文档: 不因 PEEP 缺失而跳过整个患者
-                peep_val = None
-                peep_doc = None
-                if icu08_arm in ("invasive", "noninvasive"):
-                    peep_doc = db.bedside.find_one(
-                        {"pid": pid, "code": "param_vent_peep", "valid": True,
-                         "time": {"$gte": win, "$lte": pf_time}},
-                        {"strVal": 1}, sort=[("time", -1)])
-                    if peep_doc:
-                        raw_peep = peep_doc.get("strVal", "")
-                        if isinstance(raw_peep, str):
-                            # PEEP 单位清洗
-                            raw_peep = raw_peep.replace("cmH2O", "").replace("cmH₂O", "")
-                            raw_peep = raw_peep.replace("cmh2o", "").replace("cm", "")
-                            raw_peep = raw_peep.strip()
-                        try:
-                            peep_val = float(raw_peep) if raw_peep else None
-                        except (ValueError, TypeError):
-                            peep_val = None
-
-                # 判定三臂(使用 o2_route_map 映射结果)
-                arm = None
-                flow_val = 0  # 初始化，HFNC 臂使用
-                if icu08_arm == "invasive" and peep_val is not None and peep_val >= peep_min and pf_ratio < invasive_pf:
-                    arm = "有创"
-                elif icu08_arm == "noninvasive" and peep_val is not None and peep_val >= peep_min and pf_ratio <= noninvasive_pf:
-                    arm = "无创"
-                elif icu08_arm == "hfnc":
-                    # HFNC 臂:只检查流速门槛,不检查 PEEP
-                    flow_doc = db.bedside.find_one(
-                        {"pid": pid, "code": "param_吸氧流速", "valid": True,
-                         "time": {"$gte": win, "$lte": pf_time}},
-                        {"strVal": 1}, sort=[("time", -1)])
-                    if flow_doc:
-                        try:
-                            fv = flow_doc.get("strVal", "0")
-                            fv = fv.replace("L/min", "").replace("l/min", "").strip()
-                            flow_val = float(fv)
-                        except (ValueError, TypeError):
-                            pass
-                    if flow_val >= hfnc_flow_min and pf_ratio <= noninvasive_pf:
-                        arm = "高流量"
-
-                if not arm:
-                    continue  # 不入任何分母
-
-                # 匹配！查患者信息
-                seen_pids.add(pid)
-                pat_name = ""
-                mrn = bga.get("mrn", "")
-                try:
-                    pat = db.patient.find_one({"_id": ObjectId(pid)}, {"name": 1, "mrn": 1, "hisPid": 1})
-                    if pat:
-                        pat_name = pat.get("name", "")
-                        if not mrn: mrn = pat.get("mrn", "") or pat.get("hisPid", "")
-                except Exception:
-                    pass
-                # PEEP 时间分级 (staleness grading)
-                peep_grade = None
-                if peep_val is not None and peep_doc:
-                    peep_ts = peep_doc.get("time") or peep_doc.get("eventExe", {}).get("startTime")
-                    if isinstance(peep_ts, datetime):
-                        delta_min = abs((pf_time - peep_ts).total_seconds()) / 60
-                        if delta_min <= 60:
-                            peep_grade = "A"   # ≤1h
-                        elif delta_min <= 240:
-                            peep_grade = "B"   # ≤4h
-                        elif delta_min <= 480:
-                            peep_grade = "C"   # ≤8h
-
-                den_patients.append({
-                    "pid": pid, "mrn": mrn, "name": pat_name,
-                    "pf_ratio": pf_ratio, "peep": peep_val,
-                    "peep_grade": peep_grade,
-                    "o2_route": o2_raw, "arm": arm, "flow_val": flow_val if arm == "高流量" else None,
-                    "pf_time": pf_time,
-                    "exclusion_key": build_exclusion_key(pid, pf_time),
-                })
-
-            break
-        except Exception as _exc:
-            logger.warning("DB %s failed in get_icu08_data: %s", db_name, _exc)
-            continue
-
-    # 分子：统计月与住院期交集窗口内的俯卧位
-    num_result = get_ards_prone_numerator(den_patients, dept_codes, start_date, end_date)
-
-    # 窗口自检：分子不得大于分母
-    if num_result["num_count"] > len(den_patients):
-        logger.warning("[ICU-08] 分子(%d) 大于 分母(%d),窗口口径异常,已截断",
-                       num_result["num_count"], len(den_patients))
-        num_result["num_count"] = len(den_patients)
-
-    return {
-        "den_count": len(den_patients),
-        "num_count": num_result["num_count"],
-        "den_patients": den_patients,
-        "num_patients": num_result["num_patients"],
-    }
 
 
 # ============================================================
@@ -2254,13 +2101,14 @@ FLUSH_EXCLUDE_KEYWORDS = [
     "有创压用", "创压用", "动脉压用",  # 有创血压管路维护
 ]
 
-# 机械预防关键词
+# 物理（机械）预防关键词
 MECH_DVT_KEYWORDS = [
     "间歇充气加压", "IPC",
     "充气加压", "加压泵", "抗栓泵",
     "弹力袜", "压力袜", "梯度压力袜", "抗血栓袜",
     "足底静脉泵", "足底泵", "VFP", "足底脉冲",
-    "气压治疗",   # 本院收费项「气压治疗费 单肢 bid」= 间歇充气加压(IPC)，不加会漏掉绝大多数机械预防
+    "气压治疗",   # 本院收费项「气压治疗费 单肢 bid」= 间歇充气加压(IPC)，不加会漏掉绝大多数物理预防
+    "运动功能训练",  # 院方口径 2026-10：早期运动训练属 DVT 物理预防（含「运动功能训练-每增加10分钟」加收项）
 ]
 
 # 检验项目假匹配：关键词"肝素"会命中「肝素结合蛋白（HBP）/降钙素原（PCT）二联检」，
@@ -2303,7 +2151,7 @@ def classify_dvt_order(order_name: str, exe_method=None, exe_code=None) -> str:
     """
     判断 VI_ICU_ZYYZ 的一条医嘱是否为 DVT 预防措施。
 
-    返回: "drug"（药物预防） / "mech"（机械预防） / "filter"（滤器，不计分子） / ""（不是）
+    返回: "drug"（药物预防） / "mech"（物理预防） / "filter"（滤器，不计分子） / ""（不是）
 
     剔除三类假阳性：
       1. 检验项目 —— 关键词"肝素"会命中「肝素结合蛋白（HBP）/降钙素原（PCT）二联检」
@@ -2357,8 +2205,10 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
 
     口径：**人次**（一条在科记录一行，不按 mrn 去重）。
     分子判定从分母每条在科记录出发：该次住院窗口 [入科, 出科∧月末] 内
-    有药物/机械预防医嘱即计入——「原有患者」上个月入科时下的医嘱同样命中
+    有药物/物理预防医嘱即计入——「原有患者」上个月入科时下的医嘱同样命中
     （#fix 原有患者满足分子却漏计）。
+    药物预防 = 肝素等抗凝药医嘱；物理预防 = 气压治疗、运动功能训练等
+    （院方口径 2026-10，明细 measure 展示「药物预防/物理预防/药物+物理」）。
 
     返回:
         drug_patients / mech_patients / filter_patients —— 按人归类的明细列表（审计用）
@@ -2376,6 +2226,10 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
         "drug_pids": set(), "mech_pids": set(), "filter_pids": set(),
         "drug_patients": [], "mech_patients": [], "filter_patients": [],
         "all_count": 0, "all_stay_count": 0, "num_stays": [],
+        # False = 环境性失败（DataCenter 不可达/映射失败），all_count 的 0 不可信。
+        # 预聚合侧见此标记跳过写入保留旧值；明细侧拒绝产出空列表。
+        # #fix: 原吞异常静默返回 0，重建把 0 当真实分子落库（2026-10 公式条 0 vs 明细 47）
+        "data_available": True,
     }
 
     try:
@@ -2399,6 +2253,9 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
         zybr_by_pid = {d["pid"]: d for d in zybr_docs if d.get("pid")}
         valid_pids = set(zybr_by_pid.keys())
         if not valid_pids:
+            # 分母有人却一个 pid 都映射不到 = DataCenter ZYBR 查询失败/数据漂移，
+            # 不是「无人预防」——标记不可用，防止汇总按 0 落库
+            result["data_available"] = False
             return result
 
         # Step 3: 医嘱——下界放宽到分母队列最早入科时间（覆盖「原有患者」
@@ -2470,7 +2327,7 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
         result["filter_patients"] = build_list(filter_by_pid)
 
         # Step 5: 分子 —— 从分母每条在科记录出发，该次住院窗口内
-        # 有药物/机械预防医嘱即计入（人次口径，一行一在科记录）
+        # 有药物/物理预防医嘱即计入（人次口径，一行一在科记录）
         orders_by_mrn = defaultdict(list)   # mrn → [(name, time, kind)]
         for src, kind in ((drug_by_pid, "drug"), (mech_by_pid, "mech")):
             for _pid, entries in src.items():
@@ -2485,17 +2342,20 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
             if not w:
                 continue
             in_drug = in_mech = False
-            names = []
+            drug_names, mech_names = [], []
             for name, t, kind in orders_by_mrn.get(mrn, []):
                 if isinstance(t, dt) and (t < w[0] or t > w[1]):
                     continue  # 医嘱不在该次住院窗口内（属于另一次入科）
-                names.append(name)
                 if kind == "drug":
                     in_drug = True
+                    drug_names.append(name)
                 else:
                     in_mech = True
-            if not names:
+                    mech_names.append(name)
+            if not (drug_names or mech_names):
                 continue
+            # 示例两类都露出：药物≤3 + 物理≤3（#fix 药物+物理的患者示例被高频药物挤满）
+            matched = drug_names[:3] + mech_names[:3]
             num_stays.append({
                 "patient_id": s.get("hisPid") or mrn,
                 # stay_id = SmartCare patient._id，与分母明细同一主键，
@@ -2507,10 +2367,13 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
                 "deptCode": s.get("deptCode", ""),
                 "icuAdmissionTime": s.get("icuAdmissionTime"),
                 "icuDischargeTime": s.get("icuDischargeTime"),
-                "measure": ("药物+机械" if in_drug and in_mech
-                            else "药物预防" if in_drug else "机械预防"),
-                "order_count": len(names),
-                "matched_orders": names[:5],
+                "measure": ("药物+物理" if in_drug and in_mech
+                            else "药物预防" if in_drug else "物理预防"),
+                "order_count": len(drug_names) + len(mech_names),
+                "matched_orders": matched,
+                # 页面「医嘱示例」列只取一条时，两类各留一条代表（药物+物理可拼接展示）
+                "sample_drug": drug_names[0] if drug_names else "",
+                "sample_mech": mech_names[0] if mech_names else "",
             })
         # 人次口径：不按 mrn 去重，行数 == all_count
         result["num_stays"] = num_stays
@@ -2519,10 +2382,13 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
 
         print(f"[ICU-07] 分母 {len(stays)}人次/{len(den_mrns)}人 | "
               f"分子 {result['all_count']}人次 | "
-              f"药物 {len(drug_by_pid)}pid 机械 {len(mech_by_pid)}pid")
+              f"药物 {len(drug_by_pid)}pid 物理 {len(mech_by_pid)}pid")
 
     except Exception as e:
         print(f"[ICU-07] Error: {e}")
+        # 环境性失败：调用方按 data_available=False 处理，
+        # 勿把这里静默返回的 0 当成真实分子落库/缓存
+        result["data_available"] = False
 
     return result
 
@@ -3181,18 +3047,9 @@ def judge_bundle_v3_for_patient(sc_pid: str, dc_pid: str, mrn: str, t0: datetime
     antibiotic_time = None
     antibiotic_name = None
     try:
-        abx_keywords = [
-            '头孢', '培南', '青霉', '万古', '阿奇', '左氧', '莫西',
-            '甲硝唑', '奥硝唑', '利奈', '替考', '磷霉素', '美罗',
-            '亚胺', '厄他', '哌酮', '他唑', '舒巴坦', '氨苄', '哌拉',
-            '阿莫', '克拉', '多西', '米诺', '替加', '达托', '夫西',
-            '磺胺', '呋喃', '吡哌', '诺氟', '环丙', '氧氟',
-        ]
-        non_abx = ['肝素', '低分子', '华法林', '阿司匹林', '氯吡格雷',
-                   '维生素', '氯化钾', '胰岛素', '碳酸氢钠', '呋塞米',
-                   '甘露醇', '地塞米松', '甲泼尼龙', '丙泊酚', '咪达唑仑',
-                   '芬太尼', '瑞芬太尼', '右美托咪定', '吗啡', '布洛芬',
-                   '对乙酰氨基酚', '皮试', '皮试剂']
+        # 关键词单一来源: scoring/bundle_cg.py（内容与原硬编码逐字一致）
+        from scoring.bundle_cg import ABX_KEYWORDS as abx_keywords
+        from scoring.bundle_cg import NON_ABX_KEYWORDS as non_abx
         drug_docs = list(sc.drugExe.find(
             {'pid': sc_pid, 'startTime': {'$gte': t0, '$lte': t0_6h}},
             {'drugList.name': 1, 'startTime': 1}
@@ -5510,10 +5367,9 @@ IMAGING_ABNORMAL_KEYWORDS = {
     "异常信号", "缺血", "软化灶",
 }
 NEGATIVE_IMAGING_KEYWORDS = {"未见明显异常", "未见异常", "无明显异常"}
-GCS_BEDSIDE_CODES = {"param_score_gcs_obs"}
-FOUR_BEDSIDE_CODES = {"param_score_four", "param_score_four_obs"}
-GCS_SCORE_TYPES = {"gcsScore"}
-FOUR_SCORE_TYPES = {"fourScore", "FOUR", "four", "FourScore"}
+# ICU-18 分子判定用评分类型：有 apacheII 评分即视为已完成意识(GCS)评估
+# （2026-10 口径调整：不再逐条查 GCS/FOUR 床旁与量表记录，原常量见 git 历史）
+ICU18_ASSESS_SCORE_TYPES = {"apacheII"}
 
 
 def _normalize_icd(code) -> str:
@@ -5596,6 +5452,11 @@ def _brain_injury_den_item(patient: dict, pid: str, category: str, source: str, 
 
 
 def _apply_icu18_assessments(db, den_by_pid: dict, start_dt, end_dt_wide):
+    """分子判定：分母患者窗口 [入科, 月末] 内有 apacheII 评分即视为已评估意识(GCS)。
+
+    2026-10 口径调整：不再逐条查 GCS/FOUR 床旁与量表记录——做 APACHEⅡ 评分时
+    GCS 已一并录入，故「有 apacheII 评分」即标识该患者 GCS 已评估。
+    """
     if not den_by_pid:
         return
     pids = list(den_by_pid.keys())
@@ -5615,33 +5476,17 @@ def _apply_icu18_assessments(db, den_by_pid: dict, start_dt, end_dt_wide):
             item["first_assess_time"] = assess_time
             item["assess_source"] = source
 
-    bedside_query = {
-        "pid": {"$in": pids},
-        "valid": True,
-        "code": {"$in": list(GCS_BEDSIDE_CODES | FOUR_BEDSIDE_CODES)},
-        "time": {"$gte": start_dt, "$lte": end_dt_wide},
-    }
-    for doc in db.bedside.find(
-        bedside_query,
-        {"pid": 1, "code": 1, "time": 1, "strVal": 1},
-    ).sort("time", 1).max_time_ms(30000).limit(300000):
-        code = doc.get("code")
-        source = "GCS床旁记录" if code in GCS_BEDSIDE_CODES else "FOUR床旁记录"
-        accept_assessment(doc, source)
-
     score_query = {
         "pid": {"$in": pids},
         "valid": True,
-        "scoreType": {"$in": list(GCS_SCORE_TYPES | FOUR_SCORE_TYPES)},
+        "scoreType": {"$in": list(ICU18_ASSESS_SCORE_TYPES)},
         "time": {"$gte": start_dt, "$lte": end_dt_wide},
     }
     for doc in db.score.find(
         score_query,
         {"pid": 1, "scoreType": 1, "time": 1, "total": 1},
     ).sort("time", 1).max_time_ms(30000).limit(300000):
-        stype = doc.get("scoreType")
-        source = "GCS量表评分" if stype in GCS_SCORE_TYPES else "FOUR量表评分"
-        accept_assessment(doc, source)
+        accept_assessment(doc, "APACHEⅡ评分")
 
 
 def _apply_icu18_image_reports(den_by_pid: dict, patients_by_his_pid: dict, start_dt, end_dt_wide):
@@ -5697,7 +5542,8 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-18: acute brain injury consciousness assessment rate.
     Denominator uses patient diagnosis ICD/text plus image/manual supplements.
-    Numerator is distinct denominator patients with at least one GCS or FOUR record.
+    Numerator: denominator patients with an apacheII score in [ICU admit, month end]
+    —— 有 APACHE 评分即视为已完成意识(GCS)评估（2026-10 口径调整，替代原 GCS/FOUR 判定）。
     """
     from datetime import datetime as dt
 

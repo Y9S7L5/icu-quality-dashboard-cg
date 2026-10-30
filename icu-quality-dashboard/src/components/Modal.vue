@@ -24,5 +24,7 @@ defineEmits(['close']);
 .modal-head-right { margin-left:auto; margin-right:12px; font-weight:normal; }
 .close { cursor:pointer; color:var(--text-sub); }
 .close:hover { color:var(--text-title); }
-.modal-body { padding:18px 20px; overflow-y:auto; }
+/* flex 列布局：让槽位内容（如 DetailModal）能感知弹窗可用高度，
+   配合内部 flex:1 把表格区高度约束在可视区内（横向滚动条固定在底部） */
+.modal-body { padding:18px 20px; overflow-y:auto; display:flex; flex-direction:column; flex:1; min-height:0; }
 </style>

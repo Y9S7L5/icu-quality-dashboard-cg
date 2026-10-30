@@ -66,6 +66,12 @@ export const REASON_MAP = {
   'DATA_MISSING_FLUID': '液体数据缺失',
   'SITE_UNCONFIRMED': '感染部位未确认',
   'MANUAL_EXCLUDED': '人工排除',
+  /* ICU-05 cg 简化口径（四项证据）原因码 */
+  'BLOOD_GAS_MISSING': '血气(ICU血气医嘱)未做',
+  'SPUTUM_CULTURE_MISSING': '痰培养(细菌培养)未做',
+  'BLOOD_CULTURE_MISSING': '血培养(血培养鉴定)未做',
+  'ANTIBIOTIC_MISSING': '抗生素未执行',
+  'RECHECK_BGA_MISSING': '6h内血气复查<2次',
 }
 
 /* gate 级原因（未进判定，非数据缺失） —— 与 finish=None 的"数据缺失"区分开 */
@@ -103,6 +109,14 @@ function fmtReason(code) {
 
 const COL_PATIENT_ID = { header: '住院号', get: (p) => fmtText(p.patient_id) }
 const COL_NAME       = { header: '姓名',   get: (p) => fmtText(p.name) }
+
+/* 出科三件套（后端 _enrich_admission_discharge 统一补数，所有指标明细共用）：
+   出科类型=patient.dischargedType；出科时间优先 icu_out_time（部分指标
+   discharge_time 槽位被复用为管道/评估时间等语义，不可直接读）；
+   主治医生=patient.bedPhysician。 */
+const COL_DISCHARGE_TYPE = { header: '出科类型', get: (p) => fmtText(p.discharge_type) || '/' }
+const COL_DISCHARGE_TIME = { header: '出科时间', get: (p) => fmtDate(p.icu_out_time) || '/' }
+const COL_PHYSICIAN      = { header: '主治医生', get: (p) => fmtText(p.bed_physician) || '/' }
 
 /* ============================================================
  * default 分支 col3/col4/col5 中文表头 —— 按 code + part 决定
@@ -165,20 +179,27 @@ function evalStatusHeader(code) {
 }
 
 function resolveDefaultCols(code, part) {
+  // ICU-02/03 明细行是医护人员（account 表），只留 职称；入职日期/入科类型/人数不展示
+  if (isStaffCode(code)) {
+    return [{ header: '职称', get: (p) => fmtText(p.bed_no) }]
+  }
+  // 患者类指标明细统一出科三件套：出科类型/出科时间/主治医生
+  // 出科时间优先 icu_out_time（后端 enrich 从 patient.icuDischargeTime 补），
+  // 在科患者为空时回退 discharge_time（ICU-01 分子显示「在科」）
   const base = [
     { header: resolveCol3Header(code, part), get: (p) => fmtText(p.bed_no) },
     { header: resolveCol4Header(code, part), get: (p) => fmtDate(p.admit_time) },
     { header: '入科类型', get: (p) => fmtText(p.admission_type) },
     { header: '出科类型', get: (p) => fmtText(p.discharge_type) },
-    { header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') },
+    { header: '出科时间', get: (p) => fmtDate(p.icu_out_time || p.discharge_time) || '/' },
   ]
-  if (!TYPE_TAG_CODES.includes(code)) return base
-  // 患者类型(原有/新入)、出科时间；分母再加 未评/已评（07 为 未预防/已预防）
-  base.splice(4, 0,
-    { header: '出科时间', get: (p) => fmtDate(p.discharge_time) || '/' },
-    { header: '患者类型', get: (p) => fmtText(p.patient_type || '/') },
-  )
-  if (part === 'denominator') {
+  if (TYPE_TAG_CODES.includes(code)) {
+    // 患者类型(原有/新入)；分母再加 未评/已评（07 为 未预防/已预防）
+    base.push({ header: '患者类型', get: (p) => fmtText(p.patient_type || '/') })
+  }
+  base.push({ header: '主治医生', get: (p) => fmtText(p.bed_physician) || '/' })
+  base.push({ header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') })
+  if (TYPE_TAG_CODES.includes(code) && part === 'denominator') {
     base.push({ header: evalStatusHeader(code), get: (p) => fmtText(p.eval_status || '/') })
   }
   return base
@@ -311,6 +332,9 @@ function resolveIcu05Cols(part, forExport = false) {
     }},
     { header: 'T0时间', get: (p) => fmtDate(p.t0 || p.admit_time) },
     { header: '入科类型', get: (p) => fmtText(p.admission_type || '—') },
+    COL_DISCHARGE_TYPE,
+    COL_DISCHARGE_TIME,
+    COL_PHYSICIAN,
     { header: '乳酸(mmol/L)', get: (p) => {
       const v3 = p.v3 || {}
       if (v3.lactate == null) return '—'
@@ -360,7 +384,7 @@ function resolveIcu05Cols(part, forExport = false) {
     ]),
   ]
   if (forExport) return full
-  // 界面精简列（#设计 P2: 7列 + 结论列，其余收进展开行）
+  // 界面精简列（#设计 P2: 结论列保留；出科三件套按需求全指标补齐）
   return [
     COL_PATIENT_ID,
     COL_NAME,
@@ -370,6 +394,9 @@ function resolveIcu05Cols(part, forExport = false) {
       return v == null ? '—' : Number(v).toFixed(1)
     }},
     { header: '升压药', get: (p) => ((p.v3 || {}).vaso_name ? '有' : '无') },
+    COL_DISCHARGE_TYPE,
+    COL_DISCHARGE_TIME,
+    COL_PHYSICIAN,
     { header: '结论', get: (p) => verdictOf(p).text, cls: (p) => verdictOf(p).cls },
   ]
 }
@@ -405,6 +432,8 @@ function buildColumns(code, part, opts = {}) {
       COL_NAME,
       { header: '出科时间',     get: (p) => fmtText(p.icuDischargeTime || p.admit_time || '/') },
       { header: '重返入科时间', get: (p) => fmtText(p.reIcuAdmissionTime || p.discharge_time || '/') },
+      COL_DISCHARGE_TYPE,
+      COL_PHYSICIAN,
       { header: '来源',         get: (p) => fmtText(p.event_source || p.admission_source || '/') },
       { header: '依据',         get: (p) => fmtText(p.basis || '/') },
     ]
@@ -424,6 +453,9 @@ function buildColumns(code, part, opts = {}) {
         const s = fmtText(p.assessSource || '')
         return s ? `${t} ${s}` : t
       }},
+      COL_DISCHARGE_TYPE,
+      COL_DISCHARGE_TIME,
+      COL_PHYSICIAN,
     ]
   }
 
@@ -436,6 +468,9 @@ function buildColumns(code, part, opts = {}) {
       { header: '转入计划',    get: (p) => fmtText(p.admissionPlan || p.admission_source || '/') },
       { header: '手术名称',    get: (p) => fmtText(p.operation_name || p.dept || '/') },
       { header: '转入ICU时间', get: (p) => fmtText(p.icuAdmissionTime || p.admit_time) },
+      COL_DISCHARGE_TYPE,
+      COL_DISCHARGE_TIME,
+      COL_PHYSICIAN,
       { header: '依据',        get: (p) => fmtText(p.basis || '/') },
     ]
   }
@@ -450,6 +485,9 @@ function buildColumns(code, part, opts = {}) {
       { header: '拔管时间', get: (p) => fmtDate(p.tube_end) },
       { header: airwayExtraHeader(code, part), get: airwayExtraGet(code, part) },
       { header: '例次',     get: () => '1' },
+      COL_DISCHARGE_TYPE,
+      COL_DISCHARGE_TIME,
+      COL_PHYSICIAN,
     ]
   }
 
@@ -463,6 +501,9 @@ function buildColumns(code, part, opts = {}) {
       { header: d.timeHeader,     get: d.timeGet },
       { header: d.sourceHeader,   get: d.sourceGet },
       { header: d.evidenceHeader, get: d.evidenceGet },
+      COL_DISCHARGE_TYPE,
+      COL_DISCHARGE_TIME,
+      COL_PHYSICIAN,
       { header: '判定说明',       get: (p) => fmtText(p.basis || '/') },
     ]
   }
@@ -477,6 +518,9 @@ function buildColumns(code, part, opts = {}) {
       { header: t.col4Header, get: t.col4Get },
       { header: t.col5Header, get: t.col5Get },
       { header: '时间',       get: t.timeGet },
+      COL_DISCHARGE_TYPE,
+      COL_DISCHARGE_TIME,
+      COL_PHYSICIAN,
       { header: '依据',       get: (p) => fmtText(p.basis || p.admission_source || '/') },
     ]
   }
@@ -490,8 +534,10 @@ function buildColumns(code, part, opts = {}) {
       { header: '评分中文名', get: (p) => fmtText(p.dept) },
       { header: '分值',       get: (p) => fmtText(p.value ?? '—') },
       { header: '评估时间',   get: (p) => fmtDate(p.admit_time) },
-      { header: '出科时间',   get: (p) => fmtDate(p.discharge_time) || '/' },
+      { header: '出科时间',   get: (p) => fmtDate(p.icu_out_time || p.discharge_time) || '/' },
       { header: '患者类型',   get: (p) => fmtText(p.patient_type || '/') },
+      COL_DISCHARGE_TYPE,
+      COL_PHYSICIAN,
     ]
   }
 
@@ -503,9 +549,10 @@ function buildColumns(code, part, opts = {}) {
       { header: '患者类型', get: (p) => fmtText(p.patient_type) },
       { header: '床号',     get: (p) => fmtText(p.bed_no) },
       { header: '入科时间', get: (p) => fmtDate(p.admit_time) },
-      { header: '出科时间', get: (p) => fmtDate(p.discharge_time) },
+      { header: '出科时间', get: (p) => fmtDate(p.icu_out_time || p.discharge_time) },
       { header: '入科类型', get: (p) => fmtText(p.admission_type) },
       { header: '出科类型', get: (p) => fmtText(p.discharge_type) },
+      COL_PHYSICIAN,
       { header: '住院天数', get: (p) => fmtText(p.los_days != null ? p.los_days + '天' : '/') },
     ]
   }

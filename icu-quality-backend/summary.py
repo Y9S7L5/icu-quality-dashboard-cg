@@ -18,7 +18,7 @@ from typing import Optional
 from pymongo import MongoClient, ASCENDING
 from db import (
     get_client, get_datacenter_client, BED_DB_NAMES, iter_bed_dbs,
-    get_open_bed_count, get_occupied_bed_days, get_staff_count,
+    get_open_bed_count, get_open_bed_days, get_occupied_bed_days, get_staff_count,
     get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, get_icu06_data, get_icu09_data, get_icu10_data,
     get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data,
     get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data,
@@ -43,18 +43,13 @@ REQUIRED_INDICATORS = frozenset([
 # ============================================================
 
 def _compute_icu01(dept_codes, start, end):
-    """ICU-01: ICU床位使用率"""
-    days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days + 1
+    """ICU-01: ICU床位使用率
+
+    分母 = 实际开放总床日数（bedRecord 按 time 逐日累计，见 get_open_bed_days）
+    分子 = 实际占用总床日数（过0点计1天；当日进出≥6h计1天；<6h不计）
+    """
     num = sum(get_occupied_bed_days(dc, start, end) for dc in dept_codes)
-    total_beds = sum(get_open_bed_count(dc, start, end) for dc in dept_codes)
-    if total_beds == 0:
-        for db_name in BED_DB_NAMES:
-            try:
-                db = get_client(db_name)[db_name]
-                total_beds = sum(db.configBed.count_documents({"deptCode": dc}) for dc in dept_codes)
-                if total_beds > 0: break
-            except Exception: continue
-    den = total_beds * days
+    den = sum(get_open_bed_days(dc, start, end) for dc in dept_codes)
     val = round(num / den * 100, 1) if den > 0 else 0.0
     return {"num": num, "den": den, "val": val, "val_type": "percent"}
 
@@ -122,9 +117,13 @@ def _compute_icu05(dept_codes, start, end, hour):
     """
     from scoring.candidate_engine import compute_candidate_statistics
     from config.candidate_rules import CANDIDATE_ENGINE_MODE
-    from config.bundle_rules import BUNDLE_6H_IMPLEMENTED
+    from config.bundle_rules import BUNDLE_6H_IMPLEMENTED, BUNDLE_HOSPITAL_VARIANT
 
     d = get_bundle_data_v2(dept_codes, start, end)
+    # cg 简化口径: 分母=诊断列表命中(无门控), 分子=窗口四项(+6h复查血气)
+    # get_bundle_data_v2 在 cg 下已返回 bundle_cg 的同形状数据
+    if BUNDLE_HOSPITAL_VARIANT == "cg":
+        return _compute_icu05_cg(d, dept_codes, start, end, hour)
     period = start[:7]  # "YYYY-MM"
     hour_key = f"h{hour[0]}_patients"
 
@@ -387,6 +386,72 @@ def _compute_icu05(dept_codes, start, end, hour):
     }
 
 
+def _compute_icu05_cg(d, dept_codes, start, end, hour):
+    # type: (dict, list, str, str, str) -> dict
+    """ICU-05 cg 简化口径汇总（BUNDLE_HOSPITAL_VARIANT=cg 专用）。
+
+    分母 = bundle_cg 分母行（诊断列表命中，无休克门控）− 人工排除；
+    分子 = 对应小时段完成行（⊆ 分母，构造性成立）− 人工排除。
+    返回键与 _compute_icu05 完全一致，保证 summary/详情/漏斗消费方兼容。
+    """
+    period = start[:7]  # "YYYY-MM"
+    hour_key = f"h{hour[0]}_patients"
+
+    qualified_den = [p for p in d.get("den_patients", []) if p.get("exclusion_key")]
+    den_keys = {p["exclusion_key"] for p in qualified_den}
+    qualified_num = [p for p in d.get(hour_key, [])
+                     if p.get("exclusion_key") in den_keys]
+
+    ex = apply_exclusions(f"ICU-05-{hour}", dept_codes, period,
+                          qualified_num, qualified_den)
+    num = len(ex["num_items"])
+    den = len(ex["den_items"])
+    val = round(num / den * 100, 1) if den > 0 else 0.0
+
+    n_den = len(qualified_den)
+    return {
+        "num": num, "den": den, "val": val, "val_type": "percent",
+        "raw_num": ex["raw_num"], "raw_den": ex["raw_den"],
+        "excluded_num": ex["excluded_num"], "excluded_den": ex["excluded_den"],
+        # 漏斗/候选条: cg 下 候选=休克确认=分母，完成=分子（自洽）
+        "candidate_den": n_den,
+        "old_shock_count": n_den,
+        "new_shock_count": n_den,
+        "shock_diff": 0,
+        "raw_candidate_count": n_den,
+        "high_probability_count": n_den,
+        "probable_count": 0,
+        "pending_review_count": 0,
+        "not_candidate_count": 0,
+        "diagnosis_based_count": n_den,
+        "candidate_mode": "cg",
+        "site_confirmed_count": 0,
+        "site_unconfirmed_count": 0,
+        "sofa2_mean": None,
+        "sofa2_scored_count": 0,
+        # shadow 指标与正式一致（无候选影子口径）
+        "shadow_raw_den": n_den,
+        "shadow_den_1h": den, "shadow_num_1h": num if hour == "1h" else 0,
+        "shadow_den_3h": den, "shadow_num_3h": num if hour == "3h" else 0,
+        "shadow_den_6h": den, "shadow_num_6h": num if hour == "6h" else 0,
+        "shadow_rate_1h": val if hour == "1h" else 0.0,
+        "shadow_rate_3h": val if hour == "3h" else 0.0,
+        "shadow_rate_6h": val if hour == "6h" else 0.0,
+        "shadow_raw_num_1h": ex["raw_num"] if hour == "1h" else 0,
+        "shadow_raw_num_3h": ex["raw_num"] if hour == "3h" else 0,
+        "shadow_raw_num_6h": ex["raw_num"] if hour == "6h" else 0,
+        "shadow_excluded_den_1h": ex["excluded_den"] if hour == "1h" else 0,
+        "shadow_excluded_den_3h": ex["excluded_den"] if hour == "3h" else 0,
+        "shadow_excluded_den_6h": ex["excluded_den"] if hour == "6h" else 0,
+        "shadow_excluded_num_1h": ex["excluded_num"] if hour == "1h" else 0,
+        "shadow_excluded_num_3h": ex["excluded_num"] if hour == "3h" else 0,
+        "shadow_excluded_num_6h": ex["excluded_num"] if hour == "6h" else 0,
+        "data_complete": True,
+        "failed_pids": [], "failed_sources": [],
+        "timeout_count": 0, "query_error_count": 0, "truncated_count": 0,
+    }
+
+
 def _compute_icu06(dept_codes, start, end):
     """ICU-06: 抗菌药物前病原学送检率"""
     d = get_icu06_data(dept_codes, start, end)
@@ -399,6 +464,11 @@ def _compute_icu06(dept_codes, start, end):
 def _compute_icu07(dept_codes, start, end):
     """ICU-07: DVT预防率（人次口径：一条在科记录一行，不按 mrn 去重）"""
     d = get_dvt_prevention_patients(dept_codes, start, end)
+    # 环境性失败（DataCenter 异常）：拒绝按 0 落库。
+    # rebuild_summary 见 data_available=False 会跳过写入、保留旧值并计入 skipped
+    if not d.get("data_available", True):
+        return {"num": 0, "den": 0, "val": 0.0, "val_type": "percent",
+                "data_available": False}
     # all_count = 实施预防的在科人次；分母 = 同期在科记录数（同为人次口径）
     num = d.get("all_count", 0)
     den = _count_icu_patients(dept_codes, start, end)
