@@ -555,6 +555,18 @@ LAB_ORDER_TYPES = [s.strip() for s in _env(
     "LAB_ORDER_TYPES", "检验"
 ).replace("，", ",").split(",") if s.strip()] or ["检验"]
 
+# ICU-11 SMR：首次 APACHE II 评分的入科后窗口小时数（.env 可配，默认 24）。
+# 院端评估常晚于入科 24h 录入时可放宽（如 48），重启后端生效；
+# 改动后需重建 ICU-11 预聚合与明细缓存（POST /api/admin/rebuild-summary）。
+try:
+    APACHE_WINDOW_HOURS = float(_env("APACHE_WINDOW_HOURS", "24"))
+    if APACHE_WINDOW_HOURS <= 0:
+        raise ValueError("APACHE_WINDOW_HOURS must be > 0")
+except ValueError:
+    logger.warning("Invalid APACHE_WINDOW_HOURS=%r in .env, fallback to 24",
+                   _env("APACHE_WINDOW_HOURS", ""))
+    APACHE_WINDOW_HOURS = 24.0
+
 
 # ============================================================
 # ICU-01 分母查询
@@ -4752,7 +4764,7 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     ICU-11：ICU患者标化病死指数(SMR)。
 
     分母人群 = 同期出科且 dischargedType 为“死亡/出院/非医嘱离院”，并有入科
-    24h 内首次 APACHE II 评分的完整病例。
+    APACHE_WINDOW_HOURS（.env 可配，默认 24h）内首次 APACHE II 评分的完整病例。
     分母数值 = 每例首次 APACHE II apacheII.calDead.score 之和。
     分子 = 同一人群中 dischargedType 为“死亡/非医嘱离院”的人数。
 
@@ -4822,7 +4834,7 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 admit_time = pat.get("icuAdmissionTime")
                 if not score_time or not admit_time:
                     continue
-                if score_time < admit_time or score_time > admit_time + timedelta(hours=24):
+                if score_time < admit_time or score_time > admit_time + timedelta(hours=APACHE_WINDOW_HOURS):
                     continue
                 cal_dead = (((doc.get("apacheII") or {}).get("calDead") or {}).get("score"))
                 cal_dead = _as_float_or_none(cal_dead)
@@ -5338,35 +5350,21 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
 # ICU-18: acute brain injury consciousness assessment rate
 # ============================================================
 
-PRIMARY_BRAIN_INJURY_ICD_PREFIXES = {
-    "S02", "S06", "I60", "I61", "I62", "I63",
-    "C70", "C71", "D32", "D33", "D42", "D43",
+# 急性脑损伤 ICD 编码清单（2026-10 院方口径：分母只按诊断 ICD 命中判定，
+# 清单来源 VI_ICU_ICD 查询（患者侧另补 S06）；不再做诊断文本关键词、
+# 影像报告(VI_ICU_REPORT)、diseaseDiagnosis 人工确认三条补充路径）。
+# 匹配为前缀命中：类目码覆盖其下全部亚目（如 S06 命中 S06.900），
+# 亚目码只命中自身前缀（如 K72.903 命中 K72.903x，不含 K72.901）。
+ICU18_BRAIN_INJURY_ICD_PREFIXES = {
+    "S00", "S01", "S02", "S03", "S04", "S05", "S06",
+    "I60", "I61", "I62", "I63",
+    "D43",
     "G40", "G41",
-    *{f"G0{i}" for i in range(10)},
+    "G06.006",
+    # G93.403/G93.101 已含于 G93.4/G93.1 前缀，保留以对齐院方清单条目
+    "G93.1", "G93.4", "G93.403", "G93.101",
+    "K72.903", "T67.000",
 }
-SECONDARY_BRAIN_INJURY_ICD_PREFIXES = {
-    "G93.1", "G93.4", "T67.0", "K72",
-}
-IMAGING_BRAIN_INJURY_ICD_PREFIXES = {"R90"}
-CONDITIONAL_BRAIN_INJURY_ICD_PREFIXES = {"I46", "J96", "N18", "N19"}
-
-PRIMARY_BRAIN_KEYWORDS = {
-    "颅脑损伤", "脑外伤", "头部外伤", "蛛网膜下腔出血", "蛛血", "脑出血",
-    "脑梗", "脑梗死", "脑栓塞", "颅内感染", "脑炎", "脑膜炎", "脑脓肿",
-    "脑肿瘤", "颅内占位", "胶质瘤", "脑膜瘤", "癫痫", "惊厥",
-}
-SECONDARY_BRAIN_KEYWORDS = {
-    "心肺复苏后", "复苏后", "缺血缺氧性脑病", "缺氧缺血性脑病", "热射病",
-    "代谢性脑病", "肝性脑病", "肺性脑病", "肾性脑病", "尿毒症脑病",
-    "中毒性脑病", "脑病",
-}
-IMAGING_BRAIN_KEYWORDS = {"颅脑", "头颅", "脑"}
-IMAGING_ABNORMAL_KEYWORDS = {
-    "出血", "梗死", "梗塞", "占位", "肿瘤", "水肿", "挫裂伤", "骨折",
-    "蛛网膜下腔", "硬膜下", "硬膜外", "脑疝", "脑积水", "异常密度",
-    "异常信号", "缺血", "软化灶",
-}
-NEGATIVE_IMAGING_KEYWORDS = {"未见明显异常", "未见异常", "无明显异常"}
 # ICU-18 分子判定用评分类型：有 apacheII 评分即视为已完成意识(GCS)评估
 # （2026-10 口径调整：不再逐条查 GCS/FOUR 床旁与量表记录，原常量见 git 历史）
 ICU18_ASSESS_SCORE_TYPES = {"apacheII"}
@@ -5376,61 +5374,16 @@ def _normalize_icd(code) -> str:
     return str(code or "").strip().upper()
 
 
-def _patient_text_diagnoses(patient: dict) -> list[str]:
-    texts = []
-    for field in ("clinicalDiagnosis", "admissionDiagnosis"):
-        val = patient.get(field)
-        if val:
-            texts.append(str(val))
-    for item in patient.get("diagnosisHistoryList") or []:
-        val = item.get("diagnosis") if isinstance(item, dict) else None
-        if val:
-            texts.append(str(val))
-    cleaned = []
-    for text in texts:
-        text = text.replace("[", "|").replace("]", "|")
-        for part in text.split("|"):
-            part = part.strip()
-            if part:
-                cleaned.append(part)
-    return cleaned
-
-
-def _match_keyword(texts: list[str], keywords: set[str]):
-    for text in texts:
-        for keyword in keywords:
-            if keyword in text:
-                return keyword, text
-    return "", ""
-
-
-def _match_brain_injury_icd(codes: list[str], texts: list[str]) -> tuple[str, str, str]:
-    text_joined = "|".join(texts)
+def _match_brain_injury_icd(codes: list[str]) -> tuple[str, str]:
+    """患者 ICD 命中院方急性脑损伤清单则返回 (完整icd, 命中前缀)，否则 ("", "")。"""
     for code in codes:
         icd = _normalize_icd(code)
         if not icd:
             continue
-        if any(icd.startswith(prefix) for prefix in PRIMARY_BRAIN_INJURY_ICD_PREFIXES):
-            return "原发神经", "icd", icd
-        if any(icd.startswith(prefix) for prefix in SECONDARY_BRAIN_INJURY_ICD_PREFIXES):
-            return "非原发脑损伤", "icd", icd
-        if any(icd.startswith(prefix) for prefix in IMAGING_BRAIN_INJURY_ICD_PREFIXES):
-            return "影像异常", "icd", icd
-        if any(icd.startswith(prefix) for prefix in CONDITIONAL_BRAIN_INJURY_ICD_PREFIXES):
-            kw, _ = _match_keyword([text_joined], SECONDARY_BRAIN_KEYWORDS)
-            if kw:
-                return "非原发脑损伤", "icd+text", f"{icd}+{kw}"
-    return "", "", ""
-
-
-def _match_brain_injury_text(texts: list[str]) -> tuple[str, str, str]:
-    kw, text = _match_keyword(texts, PRIMARY_BRAIN_KEYWORDS)
-    if kw:
-        return "原发神经", "文本", kw
-    kw, text = _match_keyword(texts, SECONDARY_BRAIN_KEYWORDS)
-    if kw:
-        return "非原发脑损伤", "文本", kw
-    return "", "", ""
+        for prefix in ICU18_BRAIN_INJURY_ICD_PREFIXES:
+            if icd.startswith(prefix):
+                return icd, prefix
+    return "", ""
 
 
 def _brain_injury_den_item(patient: dict, pid: str, category: str, source: str, evidence: str, confidence=1.0):
@@ -5489,59 +5442,11 @@ def _apply_icu18_assessments(db, den_by_pid: dict, start_dt, end_dt_wide):
         accept_assessment(doc, "APACHEⅡ评分")
 
 
-def _apply_icu18_image_reports(den_by_pid: dict, patients_by_his_pid: dict, start_dt, end_dt_wide):
-    if not patients_by_his_pid:
-        return
-    try:
-        dc = get_client("DataCenter")["DataCenter"]
-        if "VI_ICU_REPORT" not in dc.list_collection_names():
-            return
-        his_pids = list(patients_by_his_pid.keys())
-        query = {
-            "pid": {"$in": his_pids},
-            "$or": [
-                {"examTime": {"$gte": start_dt, "$lte": end_dt_wide}},
-                {"reportTime": {"$gte": start_dt, "$lte": end_dt_wide}},
-            ],
-            "$and": [
-                {"$or": [
-                    {"examName": {"$regex": "颅脑|头颅|脑"}},
-                    {"title": {"$regex": "颅脑|头颅|脑"}},
-                    {"bodyParts": {"$regex": "颅脑|头颅|脑"}},
-                ]},
-                {"$or": [
-                    {"diagnose": {"$regex": "出血|梗死|梗塞|占位|肿瘤|水肿|挫裂伤|骨折|脑疝|脑积水|异常"}},
-                    {"conclusion": {"$regex": "出血|梗死|梗塞|占位|肿瘤|水肿|挫裂伤|骨折|脑疝|脑积水|异常"}},
-                    {"reportDesc": {"$regex": "出血|梗死|梗塞|占位|肿瘤|水肿|挫裂伤|骨折|脑疝|脑积水|异常"}},
-                ]},
-            ],
-        }
-        for report in dc.VI_ICU_REPORT.find(
-            query,
-            {"pid": 1, "examName": 1, "title": 1, "diagnose": 1, "conclusion": 1, "reportDesc": 1, "examTime": 1, "reportTime": 1},
-        ).sort("examTime", 1).max_time_ms(30000).limit(100000):
-            his_pid = report.get("pid")
-            patient = patients_by_his_pid.get(his_pid)
-            if not patient:
-                continue
-            text = "|".join(str(report.get(f) or "") for f in ("diagnose", "conclusion", "reportDesc"))
-            if any(neg in text for neg in NEGATIVE_IMAGING_KEYWORDS):
-                continue
-            if not any(kw in text for kw in IMAGING_ABNORMAL_KEYWORDS):
-                continue
-            pid = str(patient.get("_id"))
-            if pid in den_by_pid:
-                continue
-            evidence = (report.get("examName") or report.get("title") or "颅脑影像") + ":" + text[:40]
-            den_by_pid[pid] = _brain_injury_den_item(patient, pid, "影像异常", "影像", evidence, 0.9)
-    except Exception as e:
-        print(f"[ICU-18] image report query error: {e}")
-
-
 def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-18: acute brain injury consciousness assessment rate.
-    Denominator uses patient diagnosis ICD/text plus image/manual supplements.
+    Denominator: patient diagnosis ICD codes prefix-hitting the hospital list
+    ICU18_BRAIN_INJURY_ICD_PREFIXES（2026-10 院方口径：只按诊断 ICD 判定）。
     Numerator: denominator patients with an apacheII score in [ICU admit, month end]
     —— 有 APACHE 评分即视为已完成意识(GCS)评估（2026-10 口径调整，替代原 GCS/FOUR 判定）。
     """
@@ -5571,56 +5476,30 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 {
                     "_id": 1, "hisPid": 1, "mrn": 1, "name": 1, "deptCode": 1,
                     "icuAdmissionTime": 1, "clinicalDiagnosisCodeList": 1,
-                    "dischargedDiagnosisIcd": 1, "clinicalDiagnosis": 1,
-                    "admissionDiagnosis": 1, "diagnosisHistoryList": 1,
-                    "patientOperations.name": 1,
+                    "dischargedDiagnosisIcd": 1,
                 },
             ).sort("icuAdmissionTime", 1).max_time_ms(30000).limit(200000))
             if not patients:
                 continue
 
             den_by_pid = {}
-            patients_by_pid = {str(p["_id"]): p for p in patients}
-            patients_by_his_pid = {str(p.get("hisPid")): p for p in patients if p.get("hisPid")}
-
             for patient in patients:
                 pid = str(patient["_id"])
-                texts = _patient_text_diagnoses(patient)
                 codes = []
                 for field in ("clinicalDiagnosisCodeList", "dischargedDiagnosisIcd"):
                     value = patient.get(field)
-                    if isinstance(value, list):
-                        codes.extend(value)
-                    elif value:
-                        codes.append(value)
+                    values = value if isinstance(value, list) else ([value] if value else [])
+                    for item in values:
+                        # 列表元素可能是 "|" 拼接的多码串（如 'R40.200x005|S02.900x002'），
+                        # 拆开逐码判定，否则只有整串开头的编码能命中
+                        codes.extend(seg.strip() for seg in str(item).split("|") if seg.strip())
 
-                category, source, evidence = _match_brain_injury_icd(codes, texts)
-                if not category:
-                    category, source, evidence = _match_brain_injury_text(texts)
-                if category:
-                    den_by_pid[pid] = _brain_injury_den_item(patient, pid, category, source, evidence, 1.0)
+                icd, prefix = _match_brain_injury_icd(codes)
+                if icd:
+                    evidence = icd if icd == prefix else f"{icd} (命中清单码 {prefix})"
+                    den_by_pid[pid] = _brain_injury_den_item(
+                        patient, pid, "急性脑损伤", "ICD编码", evidence, 1.0)
 
-            disease_docs = list(db.diseaseDiagnosis.find(
-                {
-                    "pid": {"$in": list(patients_by_pid.keys())},
-                    "$or": [
-                        {"brainInjury.primaryNervousDisease": {"$exists": True, "$nin": [None, ""]}},
-                        {"brainInjury.notPrimaryNervousDisease": {"$exists": True, "$nin": [None, ""]}},
-                        {"brainInjury.luNaoCheckResult": {"$exists": True, "$nin": [None, ""]}},
-                    ],
-                },
-                {"pid": 1, "brainInjury": 1},
-            ).max_time_ms(15000).limit(100000))
-            for doc in disease_docs:
-                pid = doc.get("pid")
-                patient = patients_by_pid.get(pid)
-                if not patient or pid in den_by_pid:
-                    continue
-                brain = doc.get("brainInjury") or {}
-                evidence = brain.get("primaryNervousDisease") or brain.get("notPrimaryNervousDisease") or brain.get("luNaoCheckResult") or "brainInjury"
-                den_by_pid[pid] = _brain_injury_den_item(patient, pid, "人工确认脑损伤", "diseaseDiagnosis", str(evidence), 1.0)
-
-            _apply_icu18_image_reports(den_by_pid, patients_by_his_pid, start_dt, end_dt_wide)
             _apply_icu18_assessments(db, den_by_pid, start_dt, end_dt_wide)
 
             den_patients = list(den_by_pid.values())

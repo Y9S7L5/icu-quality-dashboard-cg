@@ -118,6 +118,12 @@ const COL_DISCHARGE_TYPE = { header: '出科类型', get: (p) => fmtText(p.disch
 const COL_DISCHARGE_TIME = { header: '出科时间', get: (p) => fmtDate(p.icu_out_time) || '/' }
 const COL_PHYSICIAN      = { header: '主治医生', get: (p) => fmtText(p.bed_physician) || '/' }
 
+/* 入科时间（后端 _enrich_admission_discharge 统一补 icu_in_time ←
+   patient.icuAdmissionTime）。admit_time 槽位被部分指标复用为评分/评估/
+   送检/管道时间等语义，不可直接读。医师床位比/护士床位比(ICU-02/03)为
+   员工明细，不展示。 */
+const COL_ADMIT_TIME = { header: '入科时间', get: (p) => fmtDate(p.icu_in_time) || '/' }
+
 /* ============================================================
  * default 分支 col3/col4/col5 中文表头 —— 按 code + part 决定
  * 来源：DetailModal.vue L227-262 col3/col4/col5 computed
@@ -146,6 +152,9 @@ function resolveCol4Header(code, part) {
   if (code === 'ICU-06' && part === 'numerator') return '送检时间'
   if (code === 'ICU-07' && part === 'numerator') return '医嘱示例'
   if (code === 'ICU-11') return '首次APACHEⅡ时间'
+  // ICU-04 分子 admit_time 槽位被后端复用为首次评分时间，不能顶着
+  // 「入科时间」表头展示——改名后由 COL_ADMIT_TIME 补真入科时间
+  if (part === 'numerator' && /^ICU-04-0[1-7]$/.test(code)) return '首次评分时间'
   if (code === 'ICU-13' && part === 'numerator') return '拔管/再置管时间'
   if (code === 'ICU-12' || code === 'ICU-13') return '拔管时间'
   return '入科时间'
@@ -186,13 +195,22 @@ function resolveDefaultCols(code, part) {
   // 患者类指标明细统一出科三件套：出科类型/出科时间/主治医生
   // 出科时间优先 icu_out_time（后端 enrich 从 patient.icuDischargeTime 补），
   // 在科患者为空时回退 discharge_time（ICU-01 分子显示「在科」）
+  const col4Header = resolveCol4Header(code, part)
   const base = [
     { header: resolveCol3Header(code, part), get: (p) => fmtText(p.bed_no) },
-    { header: resolveCol4Header(code, part), get: (p) => fmtDate(p.admit_time) },
+    { header: col4Header, get: (p) => fmtDate(p.admit_time) },
+  ]
+  // col4 已是「入科时间」的指标（01 分子、04 分母、07 分母等）不重复；
+  // col4 被复用为他义的（06 送检/给药、07 医嘱示例、08 俯卧、11 APACHE、
+  // 04 分子评分时间）补统一入科时间列
+  if (col4Header !== '入科时间') {
+    base.push(COL_ADMIT_TIME)
+  }
+  base.push(
     { header: '入科类型', get: (p) => fmtText(p.admission_type) },
     { header: '出科类型', get: (p) => fmtText(p.discharge_type) },
     { header: '出科时间', get: (p) => fmtDate(p.icu_out_time || p.discharge_time) || '/' },
-  ]
+  )
   if (TYPE_TAG_CODES.includes(code)) {
     // 患者类型(原有/新入)；分母再加 未评/已评（07 为 未预防/已预防）
     base.push({ header: '患者类型', get: (p) => fmtText(p.patient_type || '/') })
@@ -313,6 +331,7 @@ function resolveIcu05Cols(part, forExport = false) {
   const full = [
     COL_PATIENT_ID,
     COL_NAME,
+    COL_ADMIT_TIME,
     { header: '候选状态', get: (p) => {
       const status = p.candidate_status || 'not_candidate'
       const label = CANDIDATE_STATUS_MAP[status] || status
@@ -388,6 +407,7 @@ function resolveIcu05Cols(part, forExport = false) {
   return [
     COL_PATIENT_ID,
     COL_NAME,
+    COL_ADMIT_TIME,
     { header: 'T0', get: (p) => fmtDate(p.t0 || p.admit_time) },
     { header: '乳酸', get: (p) => {
       const v = (p.v3 || {}).lactate
@@ -430,6 +450,7 @@ function buildColumns(code, part, opts = {}) {
     return [
       COL_PATIENT_ID,
       COL_NAME,
+      COL_ADMIT_TIME,
       { header: '出科时间',     get: (p) => fmtText(p.icuDischargeTime || p.admit_time || '/') },
       { header: '重返入科时间', get: (p) => fmtText(p.reIcuAdmissionTime || p.discharge_time || '/') },
       COL_DISCHARGE_TYPE,
@@ -447,6 +468,7 @@ function buildColumns(code, part, opts = {}) {
       { header: '脑损伤类别', get: (p) => fmtText(p.brain_category || p.bed_no || '/') },
       { header: '入分母来源', get: (p) => fmtText(p.den_source || p.dept || '/') },
       { header: '命中依据',   get: (p) => fmtText(p.evidence || p.basis || '/') },
+      { header: '入科时间',   get: (p) => fmtDate(p.admit_time) || '/' },
       { header: '是否评估',   get: (p) => fmtText(p.assessed || '/') },
       { header: '首次评估',   get: (p) => {
         const t = fmtText(p.firstAssessTime || p.discharge_time || '/')
@@ -480,6 +502,7 @@ function buildColumns(code, part, opts = {}) {
     return [
       COL_PATIENT_ID,
       COL_NAME,
+      COL_ADMIT_TIME,
       { header: '管道类型', get: (p) => fmtText(p.tube_type) },
       { header: '插管时间', get: (p) => fmtDate(p.tube_start) },
       { header: '拔管时间', get: (p) => fmtDate(p.tube_end) },
@@ -514,6 +537,7 @@ function buildColumns(code, part, opts = {}) {
     return [
       COL_PATIENT_ID,
       COL_NAME,
+      COL_ADMIT_TIME,
       { header: t.col3Header, get: t.col3Get },
       { header: t.col4Header, get: t.col4Get },
       { header: t.col5Header, get: t.col5Get },
@@ -530,6 +554,7 @@ function buildColumns(code, part, opts = {}) {
     return [
       COL_PATIENT_ID,
       COL_NAME,
+      COL_ADMIT_TIME,
       { header: '评估来源',   get: (p) => fmtText(p.bed_no) },
       { header: '评分中文名', get: (p) => fmtText(p.dept) },
       { header: '分值',       get: (p) => fmtText(p.value ?? '—') },

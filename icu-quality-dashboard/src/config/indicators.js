@@ -218,7 +218,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-18', displayCode: 'ICU-19', name: '急性脑损伤意识评估率', type: 'ratio', unit: '%',
-    numerator: '完成意识评估患者数(有APACHEⅡ评分即视为已评估GCS)', denominator: '急性脑损伤患者总数',
+    numerator: '完成意识评估患者数(有APACHEⅡ评分即视为已评估GCS)', denominator: 'ICD编码清单判定的急性脑损伤患者总数',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [90, 100], warn: [70, 100] },
     meaning: '反映脑损伤患者评估规范性', chart: 'gauge',
