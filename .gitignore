@@ -12,3 +12,22 @@ _p.py
 _patch*.py
 _test.ps1
 debug.log
+_boot_*.log
+_vfy_*.log
+
+# ===== 严禁入库：真实患者数据（含姓名/住院号/诊疗信息），公开仓库绝不带这些 =====
+ICU07_DVT预防率_*
+audit_output/
+icu-quality-backend/icu05_audit*.csv
+icu-quality-backend/*.csv
+icu-quality-backend/*.txt
+icu-quality-backend/*.json
+
+# 一次性调试/诊断产物（探针脚本、dump、测试残留）
+icu-quality-backend/scripts/_*.py
+tools/out/
+test-results/
+.playwright-cli/
+.tmp-ssh/
+.claude/
+/index.html
