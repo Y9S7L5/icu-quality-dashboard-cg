@@ -44,21 +44,21 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-04-01', name: 'APACHEⅡ≥15分收治率', type: 'ratio', unit: '%',
-    numerator: '首次APACHEⅡ≥15分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分≥15分患者数（多条按统计月取最近一次）', denominator: '同期收治患者总数',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [50, 100], warn: [30, 100] },
     meaning: '反映收治患者病情危重程度', chart: 'gauge',
   },
   {
     code: 'ICU-04-02', name: 'APACHEⅡ＜15分收治率', type: 'ratio', unit: '%',
-    numerator: '首次APACHEⅡ＜15分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分＜15分患者数（多条按统计月取最近一次）', denominator: '同期收治患者总数',
     multiplier: 100, direction: 'lower_better',
     thresholds: { good: [0, 50], warn: [0, 70] },
     meaning: '反映收治患者中病情相对较轻的比例', chart: 'gauge',
   },
   {
     code: 'ICU-04-03', name: 'APACHEⅡ评分<10分患者总数', type: 'count', unit: '人',
-    numerator: '首次APACHEⅡ<10分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分<10分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
     excludeFromAlert: true, excludeFromStatusConfig: true,
@@ -66,7 +66,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-04-04', name: '10≤APACHEⅡ评分<15分患者总数', type: 'count', unit: '人',
-    numerator: '首次APACHEⅡ 10～14分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分 10～14分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
     excludeFromAlert: true, excludeFromStatusConfig: true,
@@ -74,7 +74,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-04-05', name: '15≤APACHEⅡ评分<20分患者总数', type: 'count', unit: '人',
-    numerator: '首次APACHEⅡ 15～19分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分 15～19分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
     excludeFromAlert: true, excludeFromStatusConfig: true,
@@ -82,7 +82,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-04-06', name: '20≤APACHEⅡ评分<25分患者总数', type: 'count', unit: '人',
-    numerator: '首次APACHEⅡ 20～24分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分 20～24分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
     excludeFromAlert: true, excludeFromStatusConfig: true,
@@ -90,7 +90,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-04-07', name: 'APACHEⅡ评分≥25分患者总数', type: 'count', unit: '人',
-    numerator: '首次APACHEⅡ≥25分患者数', denominator: '同期收治患者总数',
+    numerator: 'APACHEⅡ评分≥25分患者数', denominator: '同期收治患者总数',
     multiplier: 1, direction: 'range',
     thresholds: { good: [0, 999999], warn: [0, 999999] },
     excludeFromAlert: true, excludeFromStatusConfig: true,
@@ -169,7 +169,7 @@ export const INDICATORS = [
       type: 'special',
       lines: [
         '标化病死指数 = 实际病死率 ÷ 预计病死率',
-        '预计病死率 = Σ每位患者首次APACHEⅡ预计病死率 ÷ 收治总数',
+        '预计病死率 = Σ每位患者APACHEⅡ预计病死率（多条按统计月取最近一次） ÷ 收治总数',
         '实际病死率 = 实际死亡人数 ÷ 收治总数',
       ],
     },
@@ -218,7 +218,7 @@ export const INDICATORS = [
   },
   {
     code: 'ICU-18', displayCode: 'ICU-19', name: '急性脑损伤意识评估率', type: 'ratio', unit: '%',
-    numerator: '完成意识评估患者数(有APACHEⅡ评分即视为已评估GCS)', denominator: 'ICD编码清单判定的急性脑损伤患者总数',
+    numerator: '完成意识评估患者数(有APACHEⅡ评分即视为已评估GCS，不限评估时间)', denominator: 'ICD编码清单判定的急性脑损伤患者总数',
     multiplier: 100, direction: 'higher_better',
     thresholds: { good: [90, 100], warn: [70, 100] },
     meaning: '反映脑损伤患者评估规范性', chart: 'gauge',

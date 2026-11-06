@@ -168,6 +168,7 @@
                 <span :class="['expand-icon', { expanded: isExpanded(p.patient_id) }]">▶</span>
               </td>
               <td v-for="c in columns" :key="c.header"
+                  :title="c.title ? c.title(p) : ''"
                   :class="[{ mono: c.header === '住院号' || c.header === '账号' }, c.cls ? c.cls(p) : '']">
                 {{ c.get(p) }}
               </td>

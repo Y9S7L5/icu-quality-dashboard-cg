@@ -555,17 +555,9 @@ LAB_ORDER_TYPES = [s.strip() for s in _env(
     "LAB_ORDER_TYPES", "检验"
 ).replace("，", ",").split(",") if s.strip()] or ["检验"]
 
-# ICU-11 SMR：首次 APACHE II 评分的入科后窗口小时数（.env 可配，默认 24）。
-# 院端评估常晚于入科 24h 录入时可放宽（如 48），重启后端生效；
-# 改动后需重建 ICU-11 预聚合与明细缓存（POST /api/admin/rebuild-summary）。
-try:
-    APACHE_WINDOW_HOURS = float(_env("APACHE_WINDOW_HOURS", "24"))
-    if APACHE_WINDOW_HOURS <= 0:
-        raise ValueError("APACHE_WINDOW_HOURS must be > 0")
-except ValueError:
-    logger.warning("Invalid APACHE_WINDOW_HOURS=%r in .env, fallback to 24",
-                   _env("APACHE_WINDOW_HOURS", ""))
-    APACHE_WINDOW_HOURS = 24.0
+# ICU-11 SMR：曾按「入科 APACHE_WINDOW_HOURS（默认 24h）内首次评分」取数。
+# 2026-11 口径：所有 apache 统计不再限定评估时间窗（_pick_apache_score 按统计月
+# 取月末前最近一次），该配置废止；.env 中 APACHE_WINDOW_HOURS 不再读取。
 
 
 # ============================================================
@@ -983,6 +975,39 @@ def dedup_persons(rows: list, time_key: str = "icuAdmissionTime") -> list:
 
 
 # ============================================================
+# APACHEⅡ 评分选取（按统计月，2026-11 口径）
+# ============================================================
+
+def _pick_apache_score(score_docs, end_dt_wide):
+    """从同一在科记录的多条 apacheII 评分中按「统计月」选取一条。
+
+    2026-11 口径：所有 apache 统计不再限定评估时间窗（入科/出科/24h 一概不看）——
+    只要有 apacheII 评估数据即算已评；多条按月份取：
+      · 取月末（end_dt_wide）前最近一次 —— 当月有评估取当月的，
+        当月没新评就沿用上一次（8/9 月各评一次：8 月统计取 8 月的、
+        9 月取 9 月的、10 月没新评取 9 月的）；
+      · 全部晚于月末（纯补录）取最早一次；无时间戳的评分仅作兜底。
+
+    score_docs 无需有序。返回选中的评分文档，无评分返回 None。
+    """
+    picked = None       # 月末（含）之前最近一次
+    late_min = None     # 月末之后最早一次（仅补录场景兜底）
+    no_time = None      # 无时间戳兜底
+    for s in score_docs:
+        t = s.get("time")
+        if not isinstance(t, datetime):
+            if no_time is None:
+                no_time = s
+            continue
+        if t <= end_dt_wide:
+            if picked is None or t >= picked.get("time"):
+                picked = s
+        elif late_min is None or t <= late_min.get("time"):
+            late_min = s
+    return picked if picked is not None else (late_min if late_min is not None else no_time)
+
+
+# ============================================================
 # ICU-04-01：APACHEⅡ≥15 收治率
 # ============================================================
 
@@ -991,11 +1016,12 @@ def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> d
     返回 {den_count, num_count, num_patients, den_patients}
 
     分母：统计期内该科室在科记录（status != invalid，入出科时间与统计期有交集）
-    分子：分母在科记录中，**本次住院期间**首次 apacheII 评分 total ≥ 15 的人次
+    分子：分母在科记录中，apacheII 评分 total ≥ 15 的人次
 
     口径：人次（一次入科算一人次，不按 mrn 去重）。
-    评分窗口 = 本次住院 [入科, 出科∧月末]（_stay_window）——
-    「原有患者」上个月入科时做的首次评分同样计入（#fix 原有患者满足分子却漏计）。
+    评分选取（2026-11 口径）：不限评估时间窗，只要有有效 apacheII 评分即算已评；
+    多条按统计月取月末前最近一次（当月有评估取当月的，没新评沿用上一次），
+    见 _pick_apache_score。
     """
     from datetime import datetime as dt, timedelta
     from bson import ObjectId
@@ -1004,7 +1030,7 @@ def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> d
     end_wide = utc_day_end_wide(end_date)
 
     result = {"den_count": 0, "num_count": 0, "num_patients": [], "den_patients": [],
-              "score_map": {}}   # str(在科_id) → 本次住院首次 apacheII total（明细标 未评/已评）
+              "score_map": {}}   # str(在科_id) → 本月选取的 apacheII total（明细标 未评/已评）
 
     # 分母：在科记录（与 ICU-07 共用 get_icu_denominator_stays，保证同队列）；
     # 人次口径：一条在科记录 = 一人次，明细与计数同为一行一人次
@@ -1016,43 +1042,32 @@ def get_icu04_apache_data(dept_codes: list, start_date: str, end_date: str) -> d
         return result
 
     pat_map = {str(p["_id"]): p for p in all_stays}
-    # 每条在科记录自身的观察窗口 [入科, 出科∧月末]，分子按此窗口判定
-    win_map = {}
-    for pid_str, p in pat_map.items():
-        w = _stay_window(p, end_wide)
-        if w:
-            win_map[pid_str] = w
 
     for db_name, db in iter_bed_dbs():
         try:
-            # 分子：拉取分母队列全部 apacheII 评分（≤月末，不限月初），
-            # Python 侧按每条在科记录的窗口取「本次住院首次」——
-            # 上个月入科时打的首次评分也能命中
+            # 分子：拉取分母队列全部 apacheII 评分（不限评估时间、不限月初），
+            # Python 侧按统计月取「月末前最近一次」（_pick_apache_score）——
+            # 上个月/上上次评估的评分在没新评的月份照样命中
             cursor = db.score.find(
                 {"pid": {"$in": den_ids},
                  "scoreType": "apacheII",
-                 "valid": True,
-                 "time": {"$lte": end_wide}},
+                 "valid": True},
                 {"pid": 1, "total": 1, "time": 1},
             ).sort("time", 1)
-            first_by_pid = {}
+            docs_by_pid = defaultdict(list)
             for s in cursor:
-                pid_str = s.get("pid", "")
-                if pid_str in first_by_pid:
-                    continue  # 该次住院已取到首次评分
-                w = win_map.get(pid_str)
-                if not w:
-                    continue
-                t = s.get("time")
-                if not isinstance(t, dt) or t < w[0] or t > w[1]:
-                    continue  # 不在本次住院窗口内（早于入科/晚于出科的脏数据）
-                first_by_pid[pid_str] = s
+                docs_by_pid[s.get("pid", "")].append(s)
+            picked_by_pid = {
+                pid_str: _pick_apache_score(docs, end_wide)
+                for pid_str, docs in docs_by_pid.items()
+            }
+            picked_by_pid = {k: v for k, v in picked_by_pid.items() if v is not None}
 
-            # 分母明细「未评/已评」标记：有本次住院窗口内有效评分即已评（与分值无关）
-            result["score_map"] = {k: v.get("total") for k, v in first_by_pid.items()}
+            # 分母明细「未评/已评」标记：有 apacheII 评分即已评（与分值无关、不看时间）
+            result["score_map"] = {k: v.get("total") for k, v in picked_by_pid.items()}
 
             num_rows = []
-            for pid_str, s in first_by_pid.items():
+            for pid_str, s in picked_by_pid.items():
                 try:
                     total = float(s.get("total"))
                 except (TypeError, ValueError):
@@ -1094,8 +1109,8 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
 
     队列/口径与 ICU-04-01 完全一致：
       分母 = get_icu_denominator_stays（人次口径，一条在科记录 = 一人次）。
-    评分口径 = 分母在科记录中，**本次住院期间**首次 apacheII total
-             （窗口 [入科, 出科∧月末]，不限统计月内，不设 total 阈值）。
+    评分口径 = 不限评估时间窗，取统计月末前最近一次 apacheII total
+             （2026-11 口径，_pick_apache_score；不设 total 阈值）。
     无评分的不进桶。
 
     分值边界（半开区间，与上报表截图 6–10 行一致）：
@@ -1143,42 +1158,32 @@ def get_apache_score_bands(dept_codes: list, start_date: str, end_date: str) -> 
         return "ge25"
 
     pat_map = {str(p["_id"]): p for p in all_stays}
-    win_map = {}
-    for pid_str, p in pat_map.items():
-        w = _stay_window(p, end_wide)
-        if w:
-            win_map[pid_str] = w
 
     for db_name, db in iter_bed_dbs():
         try:
-            # 拉取分母队列全部 apacheII 评分（≤月末，不限月初），Python 侧
-            # 按每条在科记录窗口取「本次住院首次」——原有患者上个月入科时
-            # 打的首次评分同样进桶
+            # 拉取分母队列全部 apacheII 评分（不限评估时间），Python 侧
+            # 按统计月取「月末前最近一次」（_pick_apache_score）——
+            # 原有患者上个月打的评分在没新评的月份同样进桶
             cursor = db.score.find(
                 {"pid": {"$in": den_ids},
                  "scoreType": "apacheII",
-                 "valid": True,
-                 "time": {"$lte": end_wide}},
+                 "valid": True},
                 {"pid": 1, "total": 1, "time": 1},
             ).sort("time", 1)
-            first_by_pid = {}
+            docs_by_pid = defaultdict(list)
             for s in cursor:
-                pid_str = s.get("pid", "")
-                if pid_str in first_by_pid:
-                    continue
-                w = win_map.get(pid_str)
-                if not w:
-                    continue
-                t = s.get("time")
-                if not isinstance(t, dt) or t < w[0] or t > w[1]:
-                    continue
-                first_by_pid[pid_str] = s
+                docs_by_pid[s.get("pid", "")].append(s)
+            picked_by_pid = {
+                pid_str: _pick_apache_score(docs, end_wide)
+                for pid_str, docs in docs_by_pid.items()
+            }
+            picked_by_pid = {k: v for k, v in picked_by_pid.items() if v is not None}
 
             # 分母明细「未评/已评」标记（含无法落桶的分值，只看有无评分）
-            result["score_map"] = {k: v.get("total") for k, v in first_by_pid.items()}
+            result["score_map"] = {k: v.get("total") for k, v in picked_by_pid.items()}
 
             scored_rows = []
-            for pid_str, s in first_by_pid.items():
+            for pid_str, s in picked_by_pid.items():
                 p = pat_map.get(pid_str)
                 if not p:
                     continue
@@ -4763,15 +4768,15 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-11：ICU患者标化病死指数(SMR)。
 
-    分母人群 = 同期出科且 dischargedType 为“死亡/出院/非医嘱离院”，并有入科
-    APACHE_WINDOW_HOURS（.env 可配，默认 24h）内首次 APACHE II 评分的完整病例。
-    分母数值 = 每例首次 APACHE II apacheII.calDead.score 之和。
+    分母人群 = 同期出科且 dischargedType 为“死亡/出院/非医嘱离院”，并有
+    APACHE II 预计死亡率（apacheII.calDead.score ∈ [0,1]）的完整病例。
+    评分选取（2026-11 口径）：不限评估时间窗（入科 24h 约束已取消），
+    多条按统计月取月末前最近一次（_pick_apache_score）。
+    分母数值 = 每例所取 APACHE II apacheII.calDead.score 之和。
     分子 = 同一人群中 dischargedType 为“死亡/非医嘱离院”的人数。
 
     返回 {den_count, num_count, value, den_patients, num_patients}
     """
-    from datetime import datetime as dt, timedelta
-
     start_dt = utc_day_start(start_date)
     end_dt = utc_day_start(end_date)
     end_dt_wide = utc_day_end_wide(end_date)
@@ -4822,28 +4827,29 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 },
             ).sort("time", 1).max_time_ms(15000).limit(300000))
 
-            first_score_by_pid = {}
+            # 2026-11 口径：不再限入科 24h 窗口——只要有带有效 calDead 的
+            # apacheII 评分即入组；多条按统计月取月末前最近一次
+            usable_by_pid = defaultdict(list)
             for doc in score_docs:
                 spid = doc.get("pid")
-                if spid in first_score_by_pid:
-                    continue
-                pat = pat_by_pid.get(spid)
-                if not pat:
-                    continue
-                score_time = doc.get("time")
-                admit_time = pat.get("icuAdmissionTime")
-                if not score_time or not admit_time:
-                    continue
-                if score_time < admit_time or score_time > admit_time + timedelta(hours=APACHE_WINDOW_HOURS):
+                if spid not in pat_by_pid:
                     continue
                 cal_dead = (((doc.get("apacheII") or {}).get("calDead") or {}).get("score"))
                 cal_dead = _as_float_or_none(cal_dead)
                 if cal_dead is None or cal_dead < 0 or cal_dead > 1:
                     continue
-                first_score_by_pid[spid] = {
-                    "time": score_time,
+                doc["_cal_dead"] = cal_dead
+                usable_by_pid[spid].append(doc)
+
+            picked_score_by_pid = {}
+            for spid, docs in usable_by_pid.items():
+                doc = _pick_apache_score(docs, end_dt_wide)
+                if not doc:
+                    continue
+                picked_score_by_pid[spid] = {
+                    "time": doc.get("time"),
                     "total": doc.get("total"),
-                    "cal_dead": cal_dead,
+                    "cal_dead": doc["_cal_dead"],
                 }
 
             den_patients = []
@@ -4851,7 +4857,7 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             expected_deaths = 0.0
             actual_deaths = 0
 
-            for spid, score in first_score_by_pid.items():
+            for spid, score in picked_score_by_pid.items():
                 pat = pat_by_pid[spid]
                 discharged_type = pat.get("dischargedType", "")
                 expected_deaths += score["cal_dead"]
@@ -5404,42 +5410,38 @@ def _brain_injury_den_item(patient: dict, pid: str, category: str, source: str, 
     }
 
 
-def _apply_icu18_assessments(db, den_by_pid: dict, start_dt, end_dt_wide):
-    """分子判定：分母患者窗口 [入科, 月末] 内有 apacheII 评分即视为已评估意识(GCS)。
+def _apply_icu18_assessments(db, den_by_pid: dict, end_dt_wide):
+    """分子判定：分母患者有 apacheII 评分即视为已评估意识(GCS)，不看评估时间。
 
     2026-10 口径调整：不再逐条查 GCS/FOUR 床旁与量表记录——做 APACHEⅡ 评分时
     GCS 已一并录入，故「有 apacheII 评分」即标识该患者 GCS 已评估。
+    2026-11 口径调整：评分不再限定时间窗（入科前后、月末内外补录均算）；
+    展示的评估时间按统计月取月末前最近一次（_pick_apache_score）。
     """
     if not den_by_pid:
         return
     pids = list(den_by_pid.keys())
 
-    def accept_assessment(doc, source):
-        pid = doc.get("pid")
-        item = den_by_pid.get(pid)
-        if not item:
-            return
-        assess_time = doc.get("time")
-        patient_admit = item.get("icu_admit") or start_dt
-        if assess_time and (assess_time < patient_admit or assess_time > end_dt_wide):
-            return
-        old_time = item.get("first_assess_time")
-        if not old_time or (assess_time and assess_time < old_time):
-            item["assessed"] = True
-            item["first_assess_time"] = assess_time
-            item["assess_source"] = source
-
     score_query = {
         "pid": {"$in": pids},
         "valid": True,
         "scoreType": {"$in": list(ICU18_ASSESS_SCORE_TYPES)},
-        "time": {"$gte": start_dt, "$lte": end_dt_wide},
     }
+    docs_by_pid = defaultdict(list)
     for doc in db.score.find(
         score_query,
         {"pid": 1, "scoreType": 1, "time": 1, "total": 1},
     ).sort("time", 1).max_time_ms(30000).limit(300000):
-        accept_assessment(doc, "APACHEⅡ评分")
+        docs_by_pid[doc.get("pid")].append(doc)
+
+    for pid, item in den_by_pid.items():
+        docs = docs_by_pid.get(pid)
+        if not docs:
+            continue
+        picked = _pick_apache_score(docs, end_dt_wide)
+        item["assessed"] = True
+        item["first_assess_time"] = picked.get("time") if picked else None
+        item["assess_source"] = "APACHEⅡ评分"
 
 
 def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
@@ -5447,8 +5449,8 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     ICU-18: acute brain injury consciousness assessment rate.
     Denominator: patient diagnosis ICD codes prefix-hitting the hospital list
     ICU18_BRAIN_INJURY_ICD_PREFIXES（2026-10 院方口径：只按诊断 ICD 判定）。
-    Numerator: denominator patients with an apacheII score in [ICU admit, month end]
-    —— 有 APACHE 评分即视为已完成意识(GCS)评估（2026-10 口径调整，替代原 GCS/FOUR 判定）。
+    Numerator: denominator patients with any valid apacheII score
+    —— 有 APACHE 评分即视为已完成意识(GCS)评估，不限评估时间（2026-11 口径）。
     """
     from datetime import datetime as dt
 
@@ -5500,7 +5502,7 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     den_by_pid[pid] = _brain_injury_den_item(
                         patient, pid, "急性脑损伤", "ICD编码", evidence, 1.0)
 
-            _apply_icu18_assessments(db, den_by_pid, start_dt, end_dt_wide)
+            _apply_icu18_assessments(db, den_by_pid, end_dt_wide)
 
             den_patients = list(den_by_pid.values())
             num_patients = [p for p in den_patients if p.get("assessed")]
@@ -6369,6 +6371,39 @@ def _patient_diagnosis_text(patient: dict) -> str:
     return "；".join(p for p in parts if p)
 
 
+def diagnosis_display_text(patient: dict) -> str:
+    """明细「诊断」列展示文本。
+
+    - 只取**第一个非空**诊断字段（clinicalDiagnosis 几乎全量覆盖，且与
+      admissionDiagnosis 内容重复——四个字段全部拼接会得到重复长串）；
+      全空时退回 diagnosisHistoryList 的诊断条目。
+    - HIS 文本用 `;` / `|` 做分隔，统一转成中文「；」并整段去重。
+    - 结果截断 500 字，防止诊断历史超长把明细缓存撑爆。
+    """
+    raw = ""
+    for key in ("clinicalDiagnosis", "admissionDiagnosis", "dischargedDiagnosis", "diagnosis"):
+        v = patient.get(key)
+        if isinstance(v, str) and v.strip():
+            raw = v
+            break
+    if not raw:
+        items = []
+        for item in patient.get("diagnosisHistoryList") or []:
+            t = (item.get("diagnosis") or item.get("name")) if isinstance(item, dict) else item
+            if t:
+                items.append(str(t))
+        raw = "|".join(items)
+    if not raw:
+        return ""
+    seen, out = set(), []
+    for seg in raw.replace("|", ";").replace("；", ";").split(";"):
+        seg = seg.strip()
+        if seg and seg not in seen:
+            seen.add(seg)
+            out.append(seg)
+    return "；".join(out)[:500]
+
+
 def _latest_numeric_bedside(db, pids: list, codes: list, start_dt, end_dt_wide) -> dict:
     result = {}
     if not codes:
@@ -6866,7 +6901,7 @@ def get_patient_census_detail(dept_codes: list, start_date: str, end_date: str,
             else:
                 return []
 
-            fields = {"_id": 1, "mrn": 1, "name": 1, "hisBed": 1,
+            fields = {"_id": 1, "mrn": 1, "hisPid": 1, "name": 1, "hisBed": 1,
                       "icuAdmissionTime": 1, "icuDischargeTime": 1}
             if part == "total":
                 # carry_in(入科<月初) 与 new_admit(入科>=月初) 按入科时间互斥，直接拼接无重复
@@ -6893,6 +6928,7 @@ def get_patient_census_detail(dept_codes: list, start_date: str, end_date: str,
                 results.append({
                     "patient_id": str(d.get("_id", "")),
                     "mrn": d.get("mrn", ""),
+                    "hisPid": d.get("hisPid", ""),
                     "name": d.get("name", ""),
                     "hisBed": d.get("hisBed", ""),
                     "icuAdmissionTime": fmt_bj(admit) if admit else "",

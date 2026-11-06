@@ -3,7 +3,7 @@
 report_export.py —《重症质控指标上报》月度上报值计算（含 APACHEⅡ 分段）。
 
 数据口径与看板一致：汇总值走 indicator_list（预聚合 + ICU-05 实时兜底），
-模板特有的拆分（原有/新入、死亡类别、24h APACHE 窗口、仅滤器）在此计算。
+模板特有的拆分（原有/新入、死亡类别、APACHEⅡ 分段、仅滤器）在此计算。
 values[key] = null 表示无系统数据（前端留空，由人工填报）。
 """
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import calendar
 import logging
 import time
-from datetime import datetime, timedelta
 
 logger = logging.getLogger("report_export")
 
@@ -108,7 +107,7 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
         vals["11.1"], vals["11.2"] = carry, len(persons) - carry
 
         # ---- 2b. APACHEⅡ 分段人数（插在 10.1/10.2 之后）----
-        # 口径与 ICU-04-01 一致（同队列、人数去重、当月首次 apacheII total），
+        # 口径与 ICU-04-01 一致（同队列、人数去重、按统计月取 apacheII total），
         # 仅分值区间不同；无评分的不进桶。
         try:
             bands = get_apache_score_bands(dept_codes, start, end)
@@ -117,49 +116,54 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
             vals["apache_15_20"] = bands.get("15_20", 0)    # 15≤·<20
             vals["apache_20_25"] = bands.get("20_25", 0)    # 20≤·<25
             vals["apache_ge25"] = bands.get("ge25", 0)      # ≥25
-            # APACHEⅡ＜15分收治率 = 首次评分<15人数 / 同期收治患者总数
+            # APACHEⅡ＜15分收治率 = 评分<15人数 / 同期收治患者总数
             _den = bands.get("den_count", 0) or 0
             _lt15 = (bands.get("lt10", 0) or 0) + (bands.get("10_15", 0) or 0)
             vals["apache_lt15_rate"] = round(_lt15 / _den * 100, 1) if _den > 0 else 0.0
         except Exception as exc:
             logger.warning("report_export apache score bands failed: %s", exc)
 
-        # 10.1 / 10.2：24h 窗口 APACHE≥15
+        # 10.1 / 10.2：APACHE≥15（2026-11 口径：不限评估时间窗——有 apacheII
+        # 评分即算；多条按统计月取月末前最近一次，_pick_apache_score）
         pid_to_key = {str(s["_id"]): person_key_of(s)
                       for s in stays if s.get("_id")}
-        first_by_pid: dict = {}
+        from db import _pick_apache_score
+        from tzutil import utc_day_end_wide
+        end_wide = utc_day_end_wide(end)
+        docs_by_pid: dict = {}
         for _db_name, db in iter_bed_dbs():
             try:
-                for r in db.score.aggregate([
-                    {"$match": {"pid": {"$in": list(pid_to_key)},
-                                "scoreType": "apacheII", "valid": True}},
-                    {"$sort": {"time": 1}},
-                    {"$group": {"_id": "$pid", "t": {"$first": "$time"},
-                                "total": {"$first": "$total"}}},
-                ]):
-                    first_by_pid[r["_id"]] = (r.get("t"), r.get("total") or 0)
+                for r in db.score.find(
+                    {"pid": {"$in": list(pid_to_key)},
+                     "scoreType": "apacheII", "valid": True},
+                    {"pid": 1, "time": 1, "total": 1},
+                ).sort("time", 1):
+                    docs_by_pid.setdefault(r.get("pid"), []).append(r)
                 break
             except Exception as exc:
                 logger.warning("report_export apache query failed: %s", exc)
                 continue
-        scores_by_key: dict = {}
-        for pid, entry in first_by_pid.items():
+        picked_by_key: dict = {}
+        for pid, docs in docs_by_pid.items():
             key = pid_to_key.get(pid)
             if not key:
                 continue
-            cur = scores_by_key.get(key)
-            if cur is None or (entry[0] and (cur[0] is None or entry[0] < cur[0])):
-                scores_by_key[key] = entry
+            picked = _pick_apache_score(docs, end_wide)
+            if not picked:
+                continue
+            cur = picked_by_key.get(key)
+            # 同人多次入科：仍按统计月取「月末前最近一次」的那次评分
+            if cur is None or (picked.get("time") and (cur.get("time") is None
+                               or picked["time"] >= cur["time"])):
+                picked_by_key[key] = picked
         carry_hit = new_hit = 0
         for p in persons:
             key = person_key_of(p)
             at = p.get("icuAdmissionTime")
-            entry = scores_by_key.get(key)
-            if not at or not entry or entry[0] is None:
+            picked = picked_by_key.get(key)
+            if not at or not picked:
                 continue
-            if not (at <= entry[0] <= at + timedelta(hours=24)):
-                continue
-            if (entry[1] or 0) < 15:
+            if (picked.get("total") or 0) < 15:
                 continue
             if _is_carry_in(at, start_dt):
                 carry_hit += 1

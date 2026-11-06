@@ -14,8 +14,9 @@ export const REPORT_ROWS = [
   { key: "5", label: "5、ICU 医师总数" },
   { key: "6", label: "6、ICU 实际开放床位数" },
   { key: "8", label: "8、ICU 护士总数" },
-  { key: "10.1", label: "10.1、原有患者中，入ICU24小时内APACHE II评分≥15分患者数" },
-  { key: "10.2", label: "10.2、新入患者中，入ICU 24小时内APACHE II评分≥15分患者数" },
+  // 2026-11 口径：apache 统计不再限定评估时间窗（不限入ICU 24h），label 同步去掉「24小时内」
+  { key: "10.1", label: "10.1、原有患者中，APACHE II评分≥15分患者数（多条按统计月取最近一次）" },
+  { key: "10.2", label: "10.2、新入患者中，APACHE II评分≥15分患者数（多条按统计月取最近一次）" },
   { key: "apache_lt15_rate", label: "10.3、APACHEⅡ＜15分收治率" },
   { key: "apache_lt10", label: "11、APACHEII评分<10分患者总数" },
   { key: "apache_10_15", label: "12、10≤APACHEII评分<15分患者总数" },

@@ -110,6 +110,25 @@ function fmtReason(code) {
 const COL_PATIENT_ID = { header: '住院号', get: (p) => fmtText(p.patient_id) }
 const COL_NAME       = { header: '姓名',   get: (p) => fmtText(p.name) }
 
+/* 诊断列：除 ICU-01(床位×天汇总行)、ICU-02/03(医护员工明细) 外全指标明细展示。
+   数据源 _enrich_admission_discharge 统一补 p.diagnosis（db.diagnosis_display_text）。
+   界面 nowrap 表格按 24 字截断 + title 悬停看全文；导出 Excel 给全量。 */
+const NO_DIAGNOSIS_CODES = ['ICU-01', 'ICU-02', 'ICU-03']
+const DIAGNOSIS_MAX = 24
+
+function makeDiagnosisCol(forExport = false) {
+  return {
+    header: '诊断',
+    get: (p) => {
+      const t = fmtText(p.diagnosis).trim()
+      if (!t) return '/'
+      if (forExport) return t
+      return t.length > DIAGNOSIS_MAX ? t.slice(0, DIAGNOSIS_MAX) + '…' : t
+    },
+    title: (p) => fmtText(p.diagnosis),
+  }
+}
+
 /* 出科三件套（后端 _enrich_admission_discharge 统一补数，所有指标明细共用）：
    出科类型=patient.dischargedType；出科时间优先 icu_out_time（部分指标
    discharge_time 槽位被复用为管道/评估时间等语义，不可直接读）；
@@ -151,10 +170,10 @@ function resolveCol4Header(code, part) {
   if (code === 'ICU-06' && part === 'denominator') return '给药 & 判定理由'
   if (code === 'ICU-06' && part === 'numerator') return '送检时间'
   if (code === 'ICU-07' && part === 'numerator') return '医嘱示例'
-  if (code === 'ICU-11') return '首次APACHEⅡ时间'
-  // ICU-04 分子 admit_time 槽位被后端复用为首次评分时间，不能顶着
-  // 「入科时间」表头展示——改名后由 COL_ADMIT_TIME 补真入科时间
-  if (part === 'numerator' && /^ICU-04-0[1-7]$/.test(code)) return '首次评分时间'
+  if (code === 'ICU-11') return 'APACHEⅡ评分时间'
+  // ICU-04 分子 admit_time 槽位被后端复用为评分时间（按统计月取最近一次），
+  // 不能顶着「入科时间」表头展示——改名后由 COL_ADMIT_TIME 补真入科时间
+  if (part === 'numerator' && /^ICU-04-0[1-7]$/.test(code)) return 'APACHEⅡ评分时间'
   if (code === 'ICU-13' && part === 'numerator') return '拔管/再置管时间'
   if (code === 'ICU-12' || code === 'ICU-13') return '拔管时间'
   return '入科时间'
@@ -165,8 +184,8 @@ function resolveCol5Header(code, part) {
   if (code === 'ICU-08' && part === 'denominator') return 'P/F值'
   if (code === 'ICU-08' && part === 'numerator') return '俯卧总次数'
   if (code === 'ICU-04-01' && part === 'numerator') return 'APACHEⅡ'
-  if (code === 'ICU-04-01' && part === 'denominator') return '首次APACHEⅡ'
-  if (part === 'denominator' && /^ICU-04-0[2-7]$/.test(code)) return '首次APACHEⅡ'
+  if (code === 'ICU-04-01' && part === 'denominator') return 'APACHEⅡ评分'
+  if (part === 'denominator' && /^ICU-04-0[2-7]$/.test(code)) return 'APACHEⅡ评分'
   if (code === 'ICU-01' && part === 'numerator') return '在床天数'
   if (code === 'ICU-06' && part === 'denominator') return '给药次数'
   if (code === 'ICU-07' && part === 'numerator') return '医嘱条数'
@@ -441,6 +460,17 @@ export function getDetailColumns(code, part, opts = {}) {
 }
 
 function buildColumns(code, part, opts = {}) {
+  const cols = buildColumnsBase(code, part, opts);
+  // 诊断列统一插在「姓名」之后（统计月前缀列在 getDetailColumns 里再前置）；
+  // ICU-01/02/03 不需要诊断 → 不加列
+  if (!NO_DIAGNOSIS_CODES.includes(code)) {
+    const idx = cols.findIndex((c) => c.header === '姓名');
+    if (idx >= 0) cols.splice(idx + 1, 0, makeDiagnosisCol(!!opts.forExport));
+  }
+  return cols;
+}
+
+function buildColumnsBase(code, part, opts = {}) {
   // ---- ICU-05 Bundle ----
   if (BUNDLE_CODES.includes(code)) {
     return resolveIcu05Cols(part, !!opts.forExport)
@@ -470,7 +500,7 @@ function buildColumns(code, part, opts = {}) {
       { header: '命中依据',   get: (p) => fmtText(p.evidence || p.basis || '/') },
       { header: '入科时间',   get: (p) => fmtDate(p.admit_time) || '/' },
       { header: '是否评估',   get: (p) => fmtText(p.assessed || '/') },
-      { header: '首次评估',   get: (p) => {
+      { header: '评估时间',   get: (p) => {
         const t = fmtText(p.firstAssessTime || p.discharge_time || '/')
         const s = fmtText(p.assessSource || '')
         return s ? `${t} ${s}` : t

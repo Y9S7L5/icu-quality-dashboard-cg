@@ -47,6 +47,7 @@
 import { ref, provide, onMounted, onUnmounted } from 'vue';
 import Dashboard from './views/Dashboard.vue';
 import StatusConfig from './views/StatusConfig.vue';
+import TargetConfig from './views/TargetConfig.vue';
 import IndicatorTable from './IndicatorTable.vue';
 import Modal from './components/Modal.vue';
 import IndicatorGuideModal from './components/IndicatorGuideModal.vue';
@@ -63,11 +64,13 @@ const navItems = [
   { key: 'dashboard', label: '大屏总览' },
   { key: 'table',     label: '指标管理' },
   { key: 'statusConfig', label: '状态配置' },
+  { key: 'targetConfig', label: '目标值配置' },
 ];
 
 const views = {
   dashboard: Dashboard,
   statusConfig: StatusConfig,
+  targetConfig: TargetConfig,
   table: IndicatorTable,
 };
 

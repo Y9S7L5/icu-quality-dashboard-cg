@@ -192,6 +192,23 @@ export async function removeExclusion(code, exclusionKey, period, icuUnit = 'all
   return resp.json();
 }
 
+// ---- 年度目标值配置 ----
+export async function fetchTargetConfig(year = '') {
+  let url = `${BASE}/targets`;
+  if (year) url += `?year=${year}`;
+  const res = await fetch(url);
+  return res.json();
+}
+
+export async function saveTargetConfig(year, targets) {
+  const res = await fetch(`${BASE}/targets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ year, targets }),
+  });
+  return res.json();
+}
+
 // ---- V3 Bundle 判定详情 ----
 export async function fetchBundleV3Detail(mrn, period = '') {
   let url = `${BASE}/bundle/v3/${encodeURIComponent(mrn)}`;

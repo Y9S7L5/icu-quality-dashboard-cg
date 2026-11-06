@@ -73,7 +73,7 @@ def _compute_icu03(dept_codes, start, end):
 
 
 def _compute_icu04(dept_codes, start, end):
-    """ICU-04-01: APACHE≥15收治率"""
+    """ICU-04-01: APACHE≥15收治率（评分不限评估时间，多条按统计月取最近一次）"""
     d = get_icu04_apache_data(dept_codes, start, end)
     num = min(d["num_count"], d["den_count"])
     den = d["den_count"]
@@ -93,7 +93,7 @@ def _compute_apache_band(band_key: str):
 
 
 def _compute_icu04_lt15(dept_codes, start, end):
-    """ICU-04-02: APACHEⅡ＜15分收治率 = 首次评分<15分人数 / 同期收治患者总数。"""
+    """ICU-04-02: APACHEⅡ＜15分收治率 = 评分<15分人数 / 同期收治患者总数。"""
     d = get_apache_score_bands(dept_codes, start, end)
     num = int(d.get("lt10", 0) or 0) + int(d.get("10_15", 0) or 0)
     den = int(d.get("den_count", 0) or 0)
@@ -767,6 +767,17 @@ def rebuild_summary(dept_codes: list, periods: list, indicators: list = None,
         stats["errors"].append({"error": "No database available"})
         return stats
 
+    # 清理历史改码残留行（如 ICU-04 拆分为 ICU-04-01~07 后的旧行），
+    # 这类行已无对应计算函数、无法重建，留着会被 read_summary 之外的路径读到。
+    try:
+        purged = coll.delete_many(
+            {"indicator": {"$nin": list(INDICATOR_COMPUTERS) + list(MOCK_INDICATORS)}})
+        if purged.deleted_count:
+            logger.info("[rebuild] purged %d stale summary rows (unknown indicator codes)",
+                        purged.deleted_count)
+    except Exception:
+        pass
+
     def _emit_progress(current_period: str = "", current_indicator: str = "", event: str = "progress"):
         if not progress_callback:
             return
@@ -1069,16 +1080,19 @@ def rebuild_recent(months: int = 13, force: bool = False):
 
 def read_summary(dept_codes: list, periods: list, indicators: list = None) -> list:
     """从汇总表读取聚合数据"""
+    # 只认现行码表（INDICATOR_COMPUTERS）内的指标：
+    # 历史改码残留行（如 ICU-04 拆分为 ICU-04-01~07 之前的旧行）不透出，
+    # 否则跨月汇总会把残留码当独立指标带进列表。
+    known = set(INDICATOR_COMPUTERS) | set(MOCK_INDICATORS)
+    wanted = set(indicators) if indicators else known
+    allowed = sorted((wanted & known) - set(NO_DATA_INDICATORS))
     for db_name in BED_DB_NAMES:
         try:
             db = get_client(db_name)[db_name]
             coll = db[SUMMARY_COLLECTION]
             dept_key = ",".join(dept_codes) if len(dept_codes) > 1 else (dept_codes[0] if dept_codes else "all")
-            query = {"dept_code": dept_key, "period": {"$in": periods}}
-            if indicators:
-                query["indicator"] = {"$in": [i for i in indicators if i not in NO_DATA_INDICATORS]}
-            else:
-                query["indicator"] = {"$nin": list(NO_DATA_INDICATORS)}
+            query = {"dept_code": dept_key, "period": {"$in": periods},
+                     "indicator": {"$in": allowed}}
             return list(coll.find(query, {"_id": 0}).sort([("indicator", 1), ("period", 1)]))
         except Exception: continue
     return []

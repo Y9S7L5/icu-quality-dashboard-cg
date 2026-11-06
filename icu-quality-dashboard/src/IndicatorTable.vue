@@ -44,6 +44,7 @@
         <colgroup>
           <col class="c-code" />
           <col class="c-name" />
+          <col class="c-target" />
           <col class="c-num" />
           <col class="c-num" />
           <col class="c-val" />
@@ -55,6 +56,7 @@
           <tr>
             <th class="t-left">编码</th>
             <th class="t-left">指标名称</th>
+            <th class="t-center">目标值</th>
             <th class="t-right">分子</th>
             <th class="t-right">分母</th>
             <th class="t-right sep">比值</th>
@@ -71,6 +73,7 @@
               <span v-if="row.excluded_den > 0" class="excl-badge" :title="`原始分母  例，人工排除  例，实际计入  例`">口径已调整</span>
               <span class="formula-icon">ƒ</span>
             </td>
+            <td class="target t-center" :class="{ 'target-empty': fmtTarget(row.code) === '-' }">{{ fmtTarget(row.code) }}</td>
             <td class="num t-right link" @click="drillDetail(row,'numerator')">{{ fmtCell(row.numerator) }}</td>
             <td class="num t-right link" @click="drillDetail(row,'denominator')" :title="census ? '= 原有 ' + census.carry_in + ' + 新入 ' + census.new_admit : ''">{{ fmtCell(row.denominator) }}</td>
             <td class="t-right sep link" @click="drillTrend(row)"><b class="val">{{ fmtValue(row) }}</b></td>
@@ -138,7 +141,7 @@ import Modal from './components/Modal.vue';
 import TrendModal from './components/TrendModal.vue';
 import DetailModal from './components/DetailModal.vue';
 import IndicatorGuideModal from './components/IndicatorGuideModal.vue';
-import { fetchIndicatorList, fetchTrend as apiFetchTrend, fetchDetail as apiFetchDetail, triggerRefresh as apiTriggerRefresh, getRefreshStatus, fetchReportValues } from './api/index.js';
+import { fetchIndicatorList, fetchTrend as apiFetchTrend, fetchDetail as apiFetchDetail, triggerRefresh as apiTriggerRefresh, getRefreshStatus, fetchReportValues, fetchTargetConfig } from './api/index.js';
 import { downloadReportWorkbook } from './utils/reportXlsx.js';
 
 // 使用 Asia/Shanghai 当前年月作为默认值
@@ -190,6 +193,19 @@ function fmtMonth(row, m) {
 }
 function fmtCell(v) { return v == null ? '/' : v; }
 function fmtValue(row) { return row.value == null ? '/' : `${row.value}${row.unit}`; }
+// ===== 年度目标值：全量缓存 "year:code" -> target_text，按查询年份展示 =====
+const targetsMap = ref({});
+function fmtTarget(code) {
+  return targetsMap.value[`${year.value}:${code}`] || '-';
+}
+async function loadTargets() {
+  try {
+    const data = await fetchTargetConfig();
+    const map = {};
+    for (const t of (data.targets || [])) map[`${t.year}:${t.indicator}`] = t.target_text;
+    targetsMap.value = map;
+  } catch { targetsMap.value = {}; }
+}
 function displayCode(code) {
   return INDICATORS.find(i => i.code === code)?.displayCode || code;
 }
@@ -568,9 +584,9 @@ async function finishRefreshTask(task) {
 function statusText(s){ return getStatusText(s, statusConfig.value); }
 
 function exportCsv() {
-  const header = '编码,指标名称,分子,分母,比值,状态\n';
+  const header = '编码,指标名称,目标值,分子,分母,比值,状态\n';
   const body = rows.value.map(r =>
-    `${displayCode(r.code)},${r.name},${r.numerator??'/'},${r.denominator??'/'},${r.value == null ? '/' : `${r.value}${r.unit}`},${statusText(r.status)}`).join('\n');
+    `${displayCode(r.code)},${r.name},${fmtTarget(r.code)},${r.numerator??'/'},${r.denominator??'/'},${r.value == null ? '/' : `${r.value}${r.unit}`},${statusText(r.status)}`).join('\n');
   const blob = new Blob(['﻿'+header+body], { type:'text/csv;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
   a.download = `ICU质控_${period.value}.csv`; a.click();
@@ -622,7 +638,7 @@ async function exportReport() {
 
 
 watch(hostDeptCode, () => { reload(true); });
-onMounted(async () => { await reload(true); });
+onMounted(async () => { await reload(true); loadTargets(); });
 window.addEventListener('status-config-updated', () => {
   statusConfig.value = getStatusConfig();
   rows.value = rows.value.map(r => {
@@ -630,6 +646,7 @@ window.addEventListener('status-config-updated', () => {
     return ind && r.value != null ? { ...r, status: evalStatus(ind, r.value, statusConfig.value) } : r;
   });
 });
+window.addEventListener('target-config-updated', loadTargets);
 </script>
 
 <style scoped>
@@ -681,8 +698,10 @@ window.addEventListener('status-config-updated', () => {
 
 .c-code, .indi-table th:nth-child(1), .indi-table td.code { width:90px !important; min-width:90px !important; max-width:90px !important; }
 .c-name, .indi-table th:nth-child(2), .indi-table td.name { width:230px !important; min-width:230px !important; max-width:230px !important; }
-.c-num, .indi-table th:nth-child(3), .indi-table th:nth-child(4), .indi-table td.num { width:76px !important; min-width:76px !important; max-width:76px !important; }
-.c-val, .indi-table th:nth-child(5), .indi-table td:nth-child(5) { width:86px !important; min-width:86px !important; max-width:86px !important; }
+.c-target, .indi-table th:nth-child(3), .indi-table td.target { width:96px !important; min-width:96px !important; max-width:96px !important; }
+.c-num, .indi-table th:nth-child(4), .indi-table th:nth-child(5), .indi-table td.num { width:76px !important; min-width:76px !important; max-width:76px !important; }
+.c-val, .indi-table th:nth-child(6), .indi-table td:nth-child(6) { width:86px !important; min-width:86px !important; max-width:86px !important; }
+.indi-table td.target-empty { color:#94a3b8; }
 .c-month, .indi-table td.month-cell { width:88px !important; min-width:88px !important; max-width:88px !important; }
 .c-status { width:86px !important; min-width:86px !important; max-width:86px !important; }
 .c-trend { width:50px !important; min-width:50px !important; max-width:50px !important; }

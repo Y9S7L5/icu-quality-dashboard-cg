@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from datetime import date, datetime, timedelta
 from tzutil import as_utc, fmt_bj, to_bj_naive, utc_day_start, utc_day_end_wide
 from ai_analyzer import analyze, get_all_ai_decisions, override_ai_decision, ensure_ai_cache_collection as ensure_ai_cache
-from db import assert_db_ready, get_open_bed_count, get_open_bed_days, get_occupied_bed_days, get_staff_count, get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, judge_bundle_v3_for_patient, get_icu08_data, get_icu06_data, get_icu09_data, get_icu10_data, get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data, get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data, get_tri_tube_suspected_warnings, get_sepsis_alert_warnings, confirm_tri_tube_warning, get_dvt_prevention_patients, get_client, BED_DB_NAMES, get_patient_census, get_patient_census_detail, iter_bed_dbs, resolve_bundle_dc_pid
+from db import assert_db_ready, get_open_bed_count, get_open_bed_days, get_occupied_bed_days, get_staff_count, get_icu04_apache_data, get_bundle_data, get_bundle_data_v2, judge_bundle_v3_for_patient, get_icu08_data, get_icu06_data, get_icu09_data, get_icu10_data, get_icu11_data, get_icu12_data, get_icu13_data, get_icu14_data, get_icu15_data, get_icu16_data, get_icu17_data, get_icu18_data, get_icu19_data, get_cauti_data, get_tri_tube_suspected_warnings, get_sepsis_alert_warnings, confirm_tri_tube_warning, get_dvt_prevention_patients, get_client, BED_DB_NAMES, get_patient_census, get_patient_census_detail, iter_bed_dbs, resolve_bundle_dc_pid, diagnosis_display_text
 import random
 import os
 import sys
@@ -175,6 +175,7 @@ def on_startup():
     summary_module.ensure_summary_collection()
     ensure_detail_cache_collection()
     ensure_exclusion_collection()
+    ensure_target_collection()
     from db import ensure_infection_site_indexes
     ensure_infection_site_indexes()
     ensure_ai_cache()
@@ -242,7 +243,7 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 35  # v26: ICU-05 cg 简化口径——分母=diagnosisHistoryList 命中
+CACHE_VERSION = 37  # v26: ICU-05 cg 简化口径——分母=diagnosisHistoryList 命中
                     #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
                     #      (ICU血气/细菌培养/血培养鉴定/抗生素,6h 窗另需血气复查≥2)
                     #      旧明细(三道门口径)作废
@@ -271,6 +272,14 @@ CACHE_VERSION = 35  # v26: ICU-05 cg 简化口径——分母=diagnosisHistoryLi
                     # v35: _enrich_admission_discharge 改 mrn/hisPid 双字段查询——ICU-11~15
                     #      等明细行只带 patient_id=hisPid，而本院 hisPid≠mrn(两套编号)，
                     #      只查 mrn 0 命中导致 入科时间/出科类型/出科时间/主治医生 全显示 /
+                    # v36: apache 评分选取口径 2026-11——所有 apache 统计（ICU-04 系列/
+                    #      ICU-11/ICU-18/上报 10.1-10.2）不再限定评估时间窗，多条按统计月
+                    #      取月末前最近一次（_pick_apache_score：8 月统计取 8 月评估的，
+                    #      9 月取 9 月的，10 月没新评沿用 9 月的）；APACHE_WINDOW_HOURS 废止
+                    # v37: 全指标明细补「诊断」列(前端 ICU-01/02/03 不展示)——
+                    #      _enrich_admission_discharge 同一次查询顺带补 diagnosis
+                    #      (db.diagnosis_display_text)；ICU-00 患者动态住院号改回
+                    #      mrn(原展示在科记录 _id 的 ObjectId 串)；旧明细缓存作废重算
                     # v12: ICU-01 口径修复(分母 bedRecord 逐日床日/分子过0点+6h规则)
                     # v12: ICU-07 明细统一住院号=mrn + detail_id=在科记录_id(分子分母可逐行对账)
                     # v13: ICU-04-01/07/09/10 统一**人数口径**(按 mrn 去重，
@@ -344,6 +353,29 @@ def ensure_exclusion_collection():
         coll.create_index([("code", 1), ("period", 1)], background=True)
     except Exception as e:
         print(f"[exclusion] ensure index failed: {e}")
+
+
+TARGET_COLLECTION = "icu_indicator_target"
+
+
+def _get_target_collection():
+    for db_name in BED_DB_NAMES:
+        try:
+            db = get_client(db_name)[db_name]
+            return db[TARGET_COLLECTION]
+        except Exception:
+            continue
+    return None
+
+
+def ensure_target_collection():
+    coll = _get_target_collection()
+    if coll is None:
+        return
+    try:
+        coll.create_index([("indicator", 1), ("year", 1)], unique=True, background=True)
+    except Exception as e:
+        print(f"[target] ensure index failed: {e}")
 
 
 def _invalidate_detail_cache(dept_codes, period, code):
@@ -645,13 +677,13 @@ SOURCE_DESC = {
     "ICU-01": {"numerator": "实际占用床位数累计之和", "denominator": "实际开放床位数累计之和"},
     "ICU-02": {"numerator": "ICU在岗执业医师总人数", "denominator": "实际开放床位数总和"},
     "ICU-03": {"numerator": "ICU在岗执业护士总人数", "denominator": "实际开放床位数总和"},
-    "ICU-04-01": {"numerator": "本次住院首次APACHEⅡ评分≥15分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-02": {"numerator": "本次住院首次APACHEⅡ评分<15分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-03": {"numerator": "本次住院首次APACHEⅡ评分<10分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-04": {"numerator": "本次住院首次APACHEⅡ评分10～14分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-05": {"numerator": "本次住院首次APACHEⅡ评分15～19分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-06": {"numerator": "本次住院首次APACHEⅡ评分20～24分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-04-07": {"numerator": "本次住院首次APACHEⅡ评分≥25分的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-01": {"numerator": "APACHEⅡ评分≥15分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-02": {"numerator": "APACHEⅡ评分<15分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-03": {"numerator": "APACHEⅡ评分<10分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-04": {"numerator": "APACHEⅡ评分10～14分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-05": {"numerator": "APACHEⅡ评分15～19分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-06": {"numerator": "APACHEⅡ评分20～24分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
+    "ICU-04-07": {"numerator": "APACHEⅡ评分≥25分的在科人次（不限评估时间，多条按统计月取最近一次）", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-05-1h": {"numerator": "1h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-3h": {"numerator": "3h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
     "ICU-05-6h": {"numerator": "6h内完成bundle患者数", "denominator": "确诊感染性休克患者数"},
@@ -1091,11 +1123,13 @@ def query_trend(code: str, year: int, icu_unit: str = "all"):
 
 def _enrich_admission_discharge(items, dept_codes):
     """Batch-add admission_type / discharge_type / bed_physician(主治医生) /
-    icu_out_time(出科时间, 北京帧) / icu_in_time(入科时间, 北京帧) from patient collection.
-    #fix: 各指标明细统一展示 出科类型/出科时间/主治医生 —— 一次批量查询补齐，
+    icu_out_time(出科时间, 北京帧) / icu_in_time(入科时间, 北京帧) / diagnosis(诊断)
+    from patient collection.
+    #fix: 各指标明细统一展示 出科类型/出科时间/主治医生/诊断 —— 一次批量查询补齐，
     不逐指标改 query_detail；icu_out_time/icu_in_time 单独成字段，避免覆盖个别指标
     复用 discharge_time/admit_time 槽位展示的其他语义（12/13 管道时间、18 评估时间、
-    04 评分时间、06 送检/给药时间等）。"""
+    04 评分时间、06 送检/给药时间等）。
+    诊断列由前端统一渲染，ICU-01/02/03（床位汇总、医护员工明细）只在展示层隐藏。"""
     if not items:
         return items
     mrns = set()
@@ -1115,7 +1149,10 @@ def _enrich_admission_discharge(items, dept_codes):
             cursor = db.patient.find(
                 {"$or": [{"mrn": {"$in": list(mrns)}}, {"hisPid": {"$in": list(mrns)}}]},
                 {"mrn": 1, "hisPid": 1, "admissionType": 1, "dischargedType": 1,
-                 "bedPhysician": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1, "_id": 0}
+                 "bedPhysician": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1,
+                 "clinicalDiagnosis": 1, "admissionDiagnosis": 1,
+                 "dischargedDiagnosis": 1, "diagnosis": 1, "diagnosisHistoryList": 1,
+                 "_id": 0}
             )
             for d in cursor:
                 info = {
@@ -1124,6 +1161,7 @@ def _enrich_admission_discharge(items, dept_codes):
                     "bed_physician": (d.get("bedPhysician") or "").strip(),
                     "icu_out_time": fmt_bj(d.get("icuDischargeTime")),
                     "icu_in_time": fmt_bj(d.get("icuAdmissionTime")),
+                    "diagnosis": diagnosis_display_text(d),
                 }
                 for key in ("mrn", "hisPid"):
                     if d.get(key):
@@ -1141,6 +1179,8 @@ def _enrich_admission_discharge(items, dept_codes):
         it["icu_out_time"] = info.get("icu_out_time", "")
         # icu_in_time：分支已带 stay 级入科时间（人次口径多次入科更准）时不覆盖
         it["icu_in_time"] = it.get("icu_in_time") or info.get("icu_in_time", "")
+        # 诊断：同 mrn 多条在科记录时取查询命中里最后一条（与其余字段一致）
+        it["diagnosis"] = info.get("diagnosis", "")
     return items
 
 def _score_cell(v):
@@ -1211,7 +1251,9 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         # db 层返回的入出科时间已是 fmt_bj 北京帧字符串，此处禁止再 fmt（会双 +8h）
         items = _census_detail(dept_codes, start_date, end_date, part)
         items = [{
-            "patient_id": p.get("patient_id", ""),
+            # 住院号展示 mrn(院内约定见 v12 ICU-07)；原 _id ObjectId 串只留作
+            # detail_id 行键（人次口径同一 mrn 多次入科需唯一键）
+            "patient_id": p.get("mrn") or p.get("hisPid") or p.get("patient_id", ""),
             "name": p.get("name", ""),
             "gender": "",
             "age": "",
@@ -1222,7 +1264,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             "admission_source": "",
             "value": 1,
             "detail_id": p.get("patient_id", ""),
-            "mrn": p.get("mrn", ""),
+            "mrn": p.get("mrn") or p.get("hisPid") or "",
             "patient_type": p.get("patient_type", ""),
             "los_days": p.get("los_days"),
         } for p in items]
@@ -1303,7 +1345,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         stay_map = {str(p.get("_id", "")): p for p in data.get("den_patients", [])}
         score_map = data.get("score_map") or {}
         if part == "numerator":
-            # 返回本次住院首次 APACHEⅡ ≥ 15 的在科记录（人次口径）
+            # 返回 APACHEⅡ ≥ 15 的在科记录（人次口径，评分按统计月取最近一次）
             items = []
             for p in data.get("num_patients", []):
                 s = stay_map.get(str(p.get("_id", "")), {})
@@ -1341,7 +1383,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "admission_source": "",
                     "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
                     "eval_status": "已评" if str(p.get("_id", "")) in score_map else "未评",
-                    # 首次 APACHEⅡ 分值（未评 → None，前端显示 —），便于核对
+                    # 统计月选取的 APACHEⅡ 分值（未评 → None，前端显示 —），便于核对
                     # 「分子(≥15) + ICU-04-02分子(<15) + 未评 = 分母」
                     "value": _score_cell(score_map.get(str(p.get("_id", "")))),
                 })
@@ -1397,7 +1439,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "admission_source": "",
                 "patient_type": "原有" if p.get("icuAdmissionTime", end_dt) < start_dt else "新入",
                 "eval_status": "已评" if str(p.get("_id", "")) in score_map else "未评",
-                # 首次 APACHEⅡ 分值（未评 → None，前端显示 —）
+                # 统计月选取的 APACHEⅡ 分值（未评 → None，前端显示 —）
                 "value": _score_cell(score_map.get(str(p.get("_id", "")))),
             })
         _enrich_admission_discharge(items, dept_codes)
@@ -3185,10 +3227,10 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         source_desc = "分子：来自 account 表，筛选 valid 护士（护士长/护理组长/护士/规培/进修/实习护士）" if part == "numerator" \
             else "分母：来自 configBed 表，统计科室实际开放床位数"
     elif code == "ICU-04-01":
-        source_desc = ("分子：来自 score 表，本次住院窗口内首次 APACHEⅡ 评分 total ≥ 15 的在科人次"
-                       "（含入科在上月的原有患者，出科后 24h 内补录的评分也计入）") if part == "numerator" \
+        source_desc = ("分子：来自 score 表，APACHEⅡ 评分 total ≥ 15 的在科人次。不限评估时间（入科前后/出科后补录均可）；"
+                       "多条评分按统计月取月末前最近一次（当月有评估取当月的，当月没新评沿用上一次）") if part == "numerator" \
             else ("分母：来自 patient 表，统计期内在科记录（排除 invalid）。人次口径 —— 一条在科记录一人次，"
-                  "不按住院号去重。评估状态列：未评 = 本次住院无有效评分；已评中首次评分 <15 者计入 ICU-04-02 分子，"
+                  "不按住院号去重。评估状态列：未评 = 无有效 APACHEⅡ 评分；已评中评分 <15 者计入 ICU-04-02 分子，"
                   "故 ICU-04-01分子 + ICU-04-02分子 + 未评 = 分母")
     elif code in ("ICU-04-03", "ICU-04-04", "ICU-04-05", "ICU-04-06", "ICU-04-07", "ICU-04-02"):
         band_desc = {
@@ -3200,10 +3242,11 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
             "ICU-04-02": "APACHEⅡ < 15 分",
         }[code]
         source_desc = (
-            f"分子：来自 score 表，本次住院窗口内首次 APACHEⅡ 评分落入「{band_desc}」的在科人次（人次口径）"
+            f"分子：来自 score 表，APACHEⅡ 评分落入「{band_desc}」的在科人次（人次口径）。"
+            "不限评估时间；多条评分按统计月取月末前最近一次"
             if part == "numerator"
             else "分母：来自 patient 表，统计期内在科患者（排除 invalid）。人次口径 —— 一条在科记录一人次，"
-                 "与 ICU-04-01 同队列；首次评分列显示本次住院首次 APACHEⅡ 分值（未评为 —）"
+                 "与 ICU-04-01 同队列；评分列显示统计月选取的 APACHEⅡ 分值（未评为 —）"
         )
     elif code in ("ICU-05-1h", "ICU-05-3h", "ICU-05-6h"):
         from config.bundle_rules import BUNDLE_HOSPITAL_VARIANT
@@ -3249,9 +3292,8 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         source_desc = "分子：分母队列中本次住院期间（含入科当月、不只统计月内）有镇静评分（RASS等）的在科记录，明细展示评分中文名、分值和时间" if part == "numerator" \
             else "分母：统计期内在科记录（人次口径 —— 一条在科记录一人次，不按住院号去重）"
     elif code == "ICU-11":
-        from db import APACHE_WINDOW_HOURS as _apw
         source_desc = "分子：已结案完整病例中在院死亡或非医嘱离院的患者数" if part == "numerator" \
-            else f"分母：死亡、出院、非医嘱离院且有入科{_apw:g}小时内首次APACHEⅡ评分病例的预计死亡率之和"
+            else "分母：死亡、出院、非医嘱离院且有APACHEⅡ预计死亡率评分病例的预计死亡率之和（评分不限评估时间，多条按统计月取最近一次）"
     elif code == "ICU-12":
         source_desc = "分子：气管插管/气插管/气切套管拔管记录中 unPlannedEndTube 为 true 的非计划拔管，已排除换管" if part == "numerator" \
             else "分母：统计期内气管插管/气插管/气切套管拔管记录，已排除 replace=true 换管"
@@ -3388,6 +3430,56 @@ def remove_exclusion(code: str, exclusion_key: str, period: str = "", icu_unit: 
             logger.exception("Failed to restore exclusion for %s/%s: %s", code, exclusion_key, exc)
             continue
     return {"ok": False, "error": "Unable to restore exclusion; see server log for database error"}
+
+
+# ============================================================
+# 年度目标值配置 CRUD 接口
+# ============================================================
+
+@app.get("/api/targets")
+def get_targets(year: int = None):
+    """读取年度目标值配置。year 省略时返回所有年份。"""
+    coll = _get_target_collection()
+    if coll is None:
+        return {"targets": []}
+    query = {} if year is None else {"year": year}
+    docs = list(coll.find(
+        query, {"_id": 0, "indicator": 1, "year": 1, "target_text": 1}
+    ).sort([("year", 1), ("indicator", 1)]))
+    return {"targets": docs}
+
+
+@app.post("/api/targets")
+def save_targets(body: dict = None):
+    """整年批量保存目标值。target_text 为空的条目删除（无文档=未配置）。"""
+    if not body or "year" not in body:
+        return {"ok": False, "error": "Missing year"}
+    try:
+        year = int(body["year"])
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Invalid year"}
+    coll = _get_target_collection()
+    if coll is None:
+        return {"ok": False, "error": "Unable to save targets; database unavailable"}
+    now = datetime.utcnow()
+    saved = removed = 0
+    for entry in (body.get("targets") or []):
+        code = (entry.get("indicator") or "").strip()
+        if not code:
+            continue
+        text = (entry.get("target_text") or "").strip()
+        if not text:
+            coll.delete_one({"indicator": code, "year": year})
+            removed += 1
+        else:
+            coll.update_one(
+                {"indicator": code, "year": year},
+                {"$set": {"target_text": text, "updated_at": now},
+                 "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+            saved += 1
+    return {"ok": True, "saved": saved, "removed": removed}
 
 
 # ============================================================
@@ -4218,7 +4310,12 @@ def _mount_frontend():
 
     @app.get("/", include_in_schema=False)
     def serve_index():
-        return FileResponse(index_file)
+        # index.html 文件名不带 hash，必须禁缓存——否则浏览器缓存旧页面后
+        # 引用的还是旧 hash 的 JS/CSS，重新打包部署也"没效果"
+        return FileResponse(index_file, headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        })
 
     app.mount("/", StaticFiles(directory=dist_dir, html=True), name="frontend")
 
