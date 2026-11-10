@@ -243,7 +243,7 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 37  # v26: ICU-05 cg 简化口径——分母=diagnosisHistoryList 命中
+CACHE_VERSION = 38  # v27: 明细 enrich 补 gender/age（全科APACHE数据表导出用）
                     #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
                     #      (ICU血气/细菌培养/血培养鉴定/抗生素,6h 窗另需血气复查≥2)
                     #      旧明细(三道门口径)作废
@@ -1121,10 +1121,28 @@ def query_trend(code: str, year: int, icu_unit: str = "all"):
     return vals
 
 
+def _age_at_birthday(birthday, ref_dt):
+    """周岁年龄：birthday/ref 为 UTC 帧 datetime（patient 存储约定），转北京帧日期算周岁。
+
+    birthday 为空/异常返回 ''；ref 缺省取当前。全科APACHE数据表「年龄」列用。"""
+    from datetime import datetime as _dt, timedelta as _td
+    if not birthday:
+        return ""
+    try:
+        bd = birthday if isinstance(birthday, _dt) else _dt.fromisoformat(str(birthday))
+        ref = ref_dt if isinstance(ref_dt, _dt) else _dt.utcnow()
+        bd = bd + _td(hours=8)   # UTC → 北京帧日期（birthday 存 15/16 点 UTC = 北京生日子夜）
+        ref = ref + _td(hours=8)
+        years = ref.year - bd.year - ((ref.month, ref.day) < (bd.month, bd.day))
+        return years if years >= 0 else ""
+    except Exception:
+        return ""
+
+
 def _enrich_admission_discharge(items, dept_codes):
     """Batch-add admission_type / discharge_type / bed_physician(主治医生) /
-    icu_out_time(出科时间, 北京帧) / icu_in_time(入科时间, 北京帧) / diagnosis(诊断)
-    from patient collection.
+    icu_out_time(出科时间, 北京帧) / icu_in_time(入科时间, 北京帧) / diagnosis(诊断) /
+    gender(性别) / age(年龄, 入科时周岁) from patient collection.
     #fix: 各指标明细统一展示 出科类型/出科时间/主治医生/诊断 —— 一次批量查询补齐，
     不逐指标改 query_detail；icu_out_time/icu_in_time 单独成字段，避免覆盖个别指标
     复用 discharge_time/admit_time 槽位展示的其他语义（12/13 管道时间、18 评估时间、
@@ -1152,6 +1170,7 @@ def _enrich_admission_discharge(items, dept_codes):
                  "bedPhysician": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1,
                  "clinicalDiagnosis": 1, "admissionDiagnosis": 1,
                  "dischargedDiagnosis": 1, "diagnosis": 1, "diagnosisHistoryList": 1,
+                 "gender": 1, "birthday": 1,
                  "_id": 0}
             )
             for d in cursor:
@@ -1162,6 +1181,8 @@ def _enrich_admission_discharge(items, dept_codes):
                     "icu_out_time": fmt_bj(d.get("icuDischargeTime")),
                     "icu_in_time": fmt_bj(d.get("icuAdmissionTime")),
                     "diagnosis": diagnosis_display_text(d),
+                    "gender": d.get("gender", ""),
+                    "age": _age_at_birthday(d.get("birthday"), d.get("icuAdmissionTime")),
                 }
                 for key in ("mrn", "hisPid"):
                     if d.get(key):
@@ -1181,6 +1202,9 @@ def _enrich_admission_discharge(items, dept_codes):
         it["icu_in_time"] = it.get("icu_in_time") or info.get("icu_in_time", "")
         # 诊断：同 mrn 多条在科记录时取查询命中里最后一条（与其余字段一致）
         it["diagnosis"] = info.get("diagnosis", "")
+        # 性别/年龄（全科APACHE数据表导出列）：已有值（如 ICU-01 患者动态）时不覆盖
+        it["gender"] = it.get("gender") or info.get("gender", "")
+        it["age"] = it.get("age") or info.get("age", "")
     return items
 
 def _score_cell(v):

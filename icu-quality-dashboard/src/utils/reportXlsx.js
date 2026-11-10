@@ -7,10 +7,10 @@
  */
 import { REPORT_TITLE, REPORT_VALUE_HEADER, REPORT_ROWS } from './reportTemplate.js';
 
-const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+export const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
 const enc = new TextEncoder();
 
-function esc(s) {
+export function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
@@ -40,7 +40,7 @@ function dosDateTime(d) {
   return { time, date };
 }
 
-function zipStore(files) {
+export function zipStore(files) {
   const now = new Date();
   const { time, date } = dosDateTime(now);
   const local = [];

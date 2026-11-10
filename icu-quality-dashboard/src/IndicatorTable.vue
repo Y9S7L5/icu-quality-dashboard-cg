@@ -16,6 +16,7 @@
         <button class="guide-btn" @click="guideVisible=true">指标说明</button>
         <button class="export-btn" @click="exportCsv">导出CSV</button>
         <button class="export-btn" :disabled="exporting" @click="exportReport">{{ exporting ? exportLabel : '导出上报表' }}</button>
+        <button class="export-btn" :disabled="exportingApache" @click="exportApacheTable">{{ exportingApache ? '导出中…' : '导出全科APACHE数据表' }}</button>
       </div>
     </div>
 
@@ -143,6 +144,7 @@ import DetailModal from './components/DetailModal.vue';
 import IndicatorGuideModal from './components/IndicatorGuideModal.vue';
 import { fetchIndicatorList, fetchTrend as apiFetchTrend, fetchDetail as apiFetchDetail, triggerRefresh as apiTriggerRefresh, getRefreshStatus, fetchReportValues, fetchTargetConfig } from './api/index.js';
 import { downloadReportWorkbook } from './utils/reportXlsx.js';
+import { exportApacheTable as downloadApacheTableXlsx } from './utils/apacheTableXlsx.js';
 
 // 使用 Asia/Shanghai 当前年月作为默认值
 const _now = new Date();
@@ -633,6 +635,29 @@ async function exportReport() {
   } finally {
     exporting.value = false;
     exportLabel.value = '';
+  }
+}
+
+// =====《重症医学科APACHEII评分表》全科导出 =====
+// 数据 = 查询范围内 ICU-04 全部分母（跨月逐月成行），按入科时间升序，
+// 底部带 APACHEⅡ 分段例数汇总（版式见 apacheTableXlsx.js）
+const exportingApache = ref(false);
+
+async function exportApacheTable() {
+  if (exportingApache.value) return;
+  exportingApache.value = true;
+  try {
+    const result = await downloadApacheTableXlsx({
+      period: period.value,
+      endPeriod: isMultiMonth.value ? periodEnd.value : '',
+      unit: unit.value,
+      unitName: deptName.value,
+    });
+    showToast(`已导出 ${result.rows} 条：${result.filename}`, 'success');
+  } catch (e) {
+    showToast(e.message || 'APACHE数据表导出失败', 'error', 6000);
+  } finally {
+    exportingApache.value = false;
   }
 }
 
