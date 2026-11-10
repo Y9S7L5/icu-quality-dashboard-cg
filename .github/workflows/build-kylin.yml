@@ -49,7 +49,8 @@ jobs:
           cache-dependency-path: icu-quality-dashboard/package-lock.json
 
       - name: 构建前端 + 麒麟单文件二进制
-        run: SYNC_FRONTEND=1 ./scripts/build-bin-kylin.sh
+        # bash 显式调用：不依赖 git 可执行位（Windows 提交易丢 mode）
+        run: SYNC_FRONTEND=1 bash ./scripts/build-bin-kylin.sh
 
       - name: 打发布包
         run: |
