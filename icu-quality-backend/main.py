@@ -243,7 +243,7 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 38  # v27: 明细 enrich 补 gender/age（全科APACHE数据表导出用）
+CACHE_VERSION = 39  # 明细住院号 patient_id 改 mrn 优先（原 hisPid 优先；本院两套编号）旧缓存作废
                     #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
                     #      (ICU血气/细菌培养/血培养鉴定/抗生素,6h 窗另需血气复查≥2)
                     #      旧明细(三道门口径)作废

@@ -2329,7 +2329,7 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
                 out.append({
                     "pid": pid,
                     "mrn": mrn,
-                    "patient_id": stay.get("hisPid") or mrn,   # 住院号
+                    "patient_id": mrn or stay.get("hisPid"),   # 住院号=mrn（本院 hisPid≠mrn）
                     "name": stay.get("name") or zybr.get("name", ""),
                     "hisBed": stay.get("hisBed", ""),
                     "icuAdmissionTime": stay.get("icuAdmissionTime"),
@@ -2374,7 +2374,7 @@ def get_dvt_prevention_patients(dept_codes: list, start_date: str, end_date: str
             # 示例两类都露出：药物≤3 + 物理≤3（#fix 药物+物理的患者示例被高频药物挤满）
             matched = drug_names[:3] + mech_names[:3]
             num_stays.append({
-                "patient_id": s.get("hisPid") or mrn,
+                "patient_id": mrn or s.get("hisPid"),
                 # stay_id = SmartCare patient._id，与分母明细同一主键，
                 # 分子/分母同一次在科可逐行对上；同一患者 2 次入科时也能区分
                 "stay_id": str(s.get("_id", "")),
@@ -4188,7 +4188,7 @@ def get_icu06_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "pid": pid,
                     "mrn": p.get("mrn", "") or hispid,
                     "name": p.get("name", ""),
-                    "patient_id": hispid,
+                    "patient_id": p.get("mrn", "") or hispid,
                     "abx_time": first_dose,
                     "abx_drug": ", ".join(drug_names[:3]),
                     "total_doses": total_doses,
@@ -4282,7 +4282,7 @@ def get_icu06_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 {"pid": pid,
                  "mrn": pat_by_pid[pid].get("mrn", "") or pat_by_pid[pid].get("hisPid", ""),
                  "name": pat_by_pid[pid].get("name", ""),
-                 "patient_id": pat_by_pid[pid].get("hisPid", ""),
+                 "patient_id": pat_by_pid[pid].get("mrn", "") or pat_by_pid[pid].get("hisPid", ""),
                  "test_time": test_detail.get(pid, {}).get("time"),
                  "test_source": test_detail.get(pid, {}).get("source", ""),
                  "test_name": test_detail.get(pid, {}).get("name", ""),
@@ -4524,7 +4524,7 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 {"pid": str(p["_id"]),
                  "mrn": p.get("mrn", "") or p.get("hisPid", ""),
                  "name": p.get("name", ""),
-                 "patient_id": p.get("hisPid", ""),
+                 "patient_id": p.get("mrn", "") or p.get("hisPid", ""),
                  "hisBed": p.get("hisBed", ""),
                  "icu_admit": p.get("icuAdmissionTime"),
                  "icu_discharge": p.get("icuDischargeTime"),
@@ -4540,7 +4540,7 @@ def get_icu09_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "pid": spid,
                     "mrn": p.get("mrn", "") or p.get("hisPid", ""),
                     "name": p.get("name", ""),
-                    "patient_id": p.get("hisPid", ""),
+                    "patient_id": p.get("mrn", "") or p.get("hisPid", ""),
                     "assess_source": detail.get("source", ""),
                     "assess_scale": detail.get("scale", ""),
                     "assess_value": detail.get("score_value", ""),
@@ -4714,7 +4714,7 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 {"pid": str(p["_id"]),
                  "mrn": p.get("mrn", "") or p.get("hisPid", ""),
                  "name": p.get("name", ""),
-                 "patient_id": p.get("hisPid", ""),
+                 "patient_id": p.get("mrn", "") or p.get("hisPid", ""),
                  "hisBed": p.get("hisBed", ""),
                  "icu_admit": p.get("icuAdmissionTime"),
                  "icu_discharge": p.get("icuDischargeTime"),
@@ -4730,7 +4730,7 @@ def get_icu10_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "pid": spid,
                     "mrn": p.get("mrn", "") or p.get("hisPid", ""),
                     "name": p.get("name", ""),
-                    "patient_id": p.get("hisPid", ""),
+                    "patient_id": p.get("mrn", "") or p.get("hisPid", ""),
                     "assess_source": detail.get("source", ""),
                     "assess_scale": detail.get("scale", ""),
                     "assess_value": detail.get("score_value", ""),
@@ -4867,7 +4867,7 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 item = {
                     "pid": spid,
                     "mrn": pat.get("mrn", "") or pat.get("hisPid", ""),
-                    "patient_id": pat.get("hisPid", "") or pat.get("mrn", ""),
+                    "patient_id": pat.get("mrn", "") or pat.get("hisPid", ""),
                     "name": pat.get("name", ""),
                     "dept_code": pat.get("deptCode", ""),
                     "icu_admit": pat.get("icuAdmissionTime"),
@@ -4996,7 +4996,7 @@ def _get_airway_tube_data(dept_codes: list, start_date: str, end_date: str) -> d
                 base_item = {
                     "pid": pid,
                     "mrn": pat.get("mrn", "") or pat.get("hisPid", ""),
-                    "patient_id": pat.get("hisPid", "") or pat.get("mrn", ""),
+                    "patient_id": pat.get("mrn", "") or pat.get("hisPid", ""),
                     "name": pat.get("name", ""),
                     "dept_code": pat.get("deptCode", ""),
                     "tube_id": str(doc.get("_id", "")),
@@ -5141,7 +5141,7 @@ def get_icu14_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 item = {
                     "pid": pid,
                     "mrn": patient.get("mrn", "") or patient.get("hisPid", ""),
-                    "patient_id": patient.get("hisPid", "") or patient.get("mrn", "") or pid[-8:],
+                    "patient_id": patient.get("mrn", "") or patient.get("hisPid", "") or pid[-8:],
                     "name": patient.get("name", ""),
                     "dept_code": patient.get("deptCode", ""),
                     "icuAdmissionTime": patient.get("icuAdmissionTime"),
@@ -5193,7 +5193,7 @@ def _icu15_patient_item(patient: dict, pid: str, discharge_time, source: str) ->
     return {
         "pid": pid,
         "mrn": patient.get("mrn", "") or patient.get("hisPid", ""),
-        "patient_id": patient.get("hisPid", "") or patient.get("mrn", "") or pid[-8:],
+        "patient_id": patient.get("mrn", "") or patient.get("hisPid", "") or pid[-8:],
         "name": patient.get("name", ""),
         "dept_code": patient.get("deptCode", ""),
         "icu_admit": patient.get("icuAdmissionTime"),
@@ -5396,7 +5396,7 @@ def _brain_injury_den_item(patient: dict, pid: str, category: str, source: str, 
     return {
         "pid": pid,
         "mrn": patient.get("mrn", "") or patient.get("hisPid", ""),
-        "patient_id": patient.get("hisPid", "") or patient.get("mrn", "") or pid[-8:],
+        "patient_id": patient.get("mrn", "") or patient.get("hisPid", "") or pid[-8:],
         "name": patient.get("name", ""),
         "dept_code": patient.get("deptCode", ""),
         "icu_admit": patient.get("icuAdmissionTime"),
@@ -5796,7 +5796,7 @@ def get_icu19_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 item = {
                     "pid": pid,
                     "mrn": p.get("mrn", "") or p.get("hisPid", ""),
-                    "patient_id": p.get("hisPid", "") or p.get("mrn", "") or pid[-8:],
+                    "patient_id": p.get("mrn", "") or p.get("hisPid", "") or pid[-8:],
                     "name": p.get("name", ""),
                     "dept_code": p.get("deptCode", ""),
                     "icu_admit": admit,
@@ -5923,7 +5923,7 @@ def _patient_item(patient, pid: str) -> dict:
     return {
         "pid": pid,
         "mrn": patient.get("mrn", "") or patient.get("hisPid", ""),
-        "patient_id": patient.get("hisPid", "") or patient.get("mrn", "") or pid[-8:],
+        "patient_id": patient.get("mrn", "") or patient.get("hisPid", "") or pid[-8:],
         "name": patient.get("name", ""),
         "dept_code": patient.get("deptCode", ""),
     }
