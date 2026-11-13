@@ -5189,7 +5189,7 @@ def _icu15_patient_identity(patient: dict, fallback_pid: str = "") -> str:
     return f"pid:{fallback_pid or str(patient.get('_id', ''))}"
 
 
-def _icu15_patient_item(patient: dict, pid: str, discharge_time, source: str) -> dict:
+def _icu15_patient_item(patient: dict, pid: str, discharge_time, source: str, discharge_type: str = "") -> dict:
     return {
         "pid": pid,
         "mrn": patient.get("mrn", "") or patient.get("hisPid", ""),
@@ -5198,6 +5198,9 @@ def _icu15_patient_item(patient: dict, pid: str, discharge_time, source: str) ->
         "dept_code": patient.get("deptCode", ""),
         "icu_admit": patient.get("icuAdmissionTime"),
         "icu_discharge": discharge_time,
+        # 事件级转出类型（2026-11 口径：分母只取「转出」）：
+        # patient 来源 = patient.dischargedType；历史来源 = hist 自带类型
+        "discharge_type": (discharge_type or "").strip(),
         "source": source,
         "basis": "同期转出ICU；依据：Patient记录" if source == "patient" else "同期转出ICU；依据：patInIcuHistoryList",
     }
@@ -5229,6 +5232,9 @@ def _icu15_add_event(events: dict, identity: str, item: dict):
         existing = events[merge_key]
         if item.get("history_re_admit") and not existing.get("history_re_admit"):
             existing["history_re_admit"] = item.get("history_re_admit")
+        # 事件级转出类型：已有值优先（patient 记录先入），缺失时互相补位
+        if not existing.get("discharge_type") and item.get("discharge_type"):
+            existing["discharge_type"] = item.get("discharge_type")
         existing["source"] = "patient+patInIcuHistoryList" if existing.get("source") != item.get("source") else existing.get("source")
         existing["basis"] = "patient record and patInIcuHistoryList discharge merged"
         return existing
@@ -5241,7 +5247,8 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
     ICU-15: transfer-out ICU then return to ICU within 48h.
 
-    Denominator is discharge events in the period, including patient ICU discharge
+    Denominator is discharge events in the period whose discharge type is 转出
+    (2026-11 院方口径；出院/死亡/类型缺失不计)，including patient ICU discharge
     records and patInIcuHistoryList ICU discharge records. Numerator is the same
     events with a later ICU admission within 48 hours.
     """
@@ -5266,6 +5273,7 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 "_id": 1, "hisPid": 1, "mrn": 1, "patientId": 1, "inHospitalNo": 1,
                 "name": 1, "deptCode": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1,
                 "dischargeTime": 1, "patInIcuHistoryList": 1, "status": 1,
+                "dischargedType": 1,
             }
 
             scoped_patients = list(db.patient.find(
@@ -5293,7 +5301,8 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     _icu15_add_event(
                         events,
                         identity,
-                        _icu15_patient_item(patient, pid, discharge_time, "patient"),
+                        _icu15_patient_item(patient, pid, discharge_time, "patient",
+                                            patient.get("dischargedType", "")),
                     )
 
                 for hist in patient.get("patInIcuHistoryList") or []:
@@ -5303,7 +5312,10 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     item = _icu15_add_event(
                         events,
                         identity,
-                        _icu15_patient_item(patient, pid, hist_discharge, "patInIcuHistoryList"),
+                        _icu15_patient_item(
+                            patient, pid, hist_discharge, "patInIcuHistoryList",
+                            hist.get("dischargedType") or hist.get("dischargeType") or "",
+                        ),
                     )
                     re_time = hist.get("reIcuAdmissionTime")
                     if re_time:
@@ -5312,6 +5324,10 @@ def get_icu15_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             den_patients = []
             num_patients = []
             for (identity, _), item in sorted(events.items(), key=lambda kv: kv[1].get("icu_discharge")):
+                # 2026-11 院方口径：分母只取转出类型「转出」（出院/死亡/类型缺失不计），
+                # 分子是分母子集，同步收窄
+                if (item.get("discharge_type") or "").strip() != "转出":
+                    continue
                 discharge_time = item.get("icu_discharge")
                 readmit = None
                 history_re_admit = item.get("history_re_admit")
@@ -5374,6 +5390,42 @@ ICU18_BRAIN_INJURY_ICD_PREFIXES = {
 # ICU-18 分子判定用评分类型：有 apacheII 评分即视为已完成意识(GCS)评估
 # （2026-10 口径调整：不再逐条查 GCS/FOUR 床旁与量表记录，原常量见 git 历史）
 ICU18_ASSESS_SCORE_TYPES = {"apacheII"}
+
+_icd_name_map_cache: dict = None
+
+
+def _icd_name_map() -> dict:
+    """VI_ICU_ICD 全量码→诊断名字典（大写码做键，兼容 x/X 亚目后缀差异）。
+
+    诊断字典很少变化，进程内一次性加载；DataCenter 不可达时返回空字典，
+    命中依据退回纯码展示。"""
+    global _icd_name_map_cache
+    if _icd_name_map_cache is not None:
+        return _icd_name_map_cache
+    m = {}
+    try:
+        dc = get_datacenter_db()
+        for d in dc.VI_ICU_ICD.find({}, {"icdCode": 1, "icdName": 1, "_id": 0}).max_time_ms(30000):
+            code = str(d.get("icdCode") or "").strip().upper()
+            name = str(d.get("icdName") or "").strip()
+            if code and name:
+                m[code] = name
+    except Exception as e:
+        print(f"[ICD] VI_ICU_ICD 字典加载失败: {e}")
+    _icd_name_map_cache = m
+    return m
+
+
+def _icd_display_name(icd: str) -> str:
+    """码→诊断名：先精确命中（大小写不敏感），缺码时回退类目码（G40.800X004→G40）。"""
+    m = _icd_name_map()
+    up = _normalize_icd(icd)
+    if not up:
+        return ""
+    name = m.get(up)
+    if name:
+        return name
+    return m.get(up.split(".")[0], "")
 
 
 def _normalize_icd(code) -> str:
@@ -5498,7 +5550,11 @@ def get_icu18_data(dept_codes: list, start_date: str, end_date: str) -> dict:
 
                 icd, prefix = _match_brain_injury_icd(codes)
                 if icd:
-                    evidence = icd if icd == prefix else f"{icd} (命中清单码 {prefix})"
+                    # 2026-11：命中依据优先展示诊断名称（纯码不好判断），
+                    # 名称查 VI_ICU_ICD 字典；字典缺码时退回纯码+命中前缀
+                    diag_name = _icd_display_name(icd)
+                    evidence = f"{diag_name}（{icd}）" if diag_name else (
+                        icd if icd == prefix else f"{icd} (命中清单码 {prefix})")
                     den_by_pid[pid] = _brain_injury_den_item(
                         patient, pid, "急性脑损伤", "ICD编码", evidence, 1.0)
 

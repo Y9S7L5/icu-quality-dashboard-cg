@@ -95,7 +95,7 @@
     </div>
 
     <!-- 公式悬浮 -->
-    <div v-if="tip.show" class="formula-tip" :style="{ left: tip.x+'px', top: tip.y+'px' }">
+    <div v-if="tip.show" ref="tipEl" class="formula-tip" :style="{ left: tip.x+'px', top: tip.y+'px' }">
       <div class="tip-title">{{ tip.data.name }}</div>
       <div v-if="tip.data.mode==='fraction'" class="tip-formula">
         <span class="fraction">
@@ -136,7 +136,7 @@
 </template>
 
 <script setup>
-import { ref, computed, inject, onMounted, watch } from 'vue';
+import { ref, computed, inject, onMounted, watch, nextTick } from 'vue';
 import { INDICATORS, evalStatus, getStatusConfig, statusText as getStatusText } from './config/indicators.js';
 import Modal from './components/Modal.vue';
 import TrendModal from './components/TrendModal.vue';
@@ -233,6 +233,7 @@ function statusStyle(status) {
 
 // 公式悬浮
 const tip = ref({ show:false, x:0, y:0, data:null });
+const tipEl = ref(null);
 function buildFormula(code) {
   const ind = INDICATORS.find(i => i.code === code); if (!ind) return null;
   const base = { name: ind.name, meaning: ind.meaning };
@@ -241,8 +242,22 @@ function buildFormula(code) {
   const sign = ind.multiplier===100?'× 100%':ind.multiplier===1000?'× 1000‰':'';
   return { ...base, mode:'fraction', numerator: ind.numerator, denominator: ind.denominator, sign };
 }
-function showTip(e, code){ const d=buildFormula(code); if(!d)return; tip.value={show:true,x:e.clientX+16,y:e.clientY+12,data:d}; }
-function moveTip(e){ if(tip.value.show){ tip.value.x=e.clientX+16; tip.value.y=e.clientY+12; } }
+function showTip(e, code){
+  const d=buildFormula(code); if(!d)return;
+  tip.value={show:true,x:e.clientX+16,y:e.clientY+12,data:d};
+  // 渲染后按实际尺寸翻转：下方放不下 → 上翻；右侧放不下 → 左翻
+  nextTick(() => {
+    const el = tipEl.value; if (!el) return;
+    const GAP = 12, MARGIN = 8;
+    const w = el.offsetWidth, h = el.offsetHeight;
+    let x = e.clientX + 16;
+    let y = e.clientY + GAP;
+    if (y + h > window.innerHeight - MARGIN) y = e.clientY - h - GAP;
+    if (x + w > window.innerWidth - MARGIN) x = e.clientX - w - 16;
+    tip.value.x = Math.max(MARGIN, x);
+    tip.value.y = Math.max(MARGIN, y);
+  });
+}
 function hideTip(){ tip.value.show=false; }
 
 // ===== 真实 API 数据加载 =====
@@ -867,11 +882,12 @@ window.addEventListener('target-config-updated', loadTargets);
 
 .formula-tip { position:fixed; z-index:200; pointer-events:none; background:#fff;
   border:1px solid var(--border); border-radius:9px; box-shadow:var(--shadow-md);
-  padding:12px 16px; min-width:230px; max-width:360px; }
+  padding:12px 16px; min-width:230px; max-width:520px; }
 .tip-title { font-size:12px; font-weight:600; color:var(--text-main); margin-bottom:10px; }
-.tip-formula { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
-.fraction { display:inline-flex; flex-direction:column; text-align:center; }
-.numerator, .denominator { padding:2px 8px; font-size:12px; white-space:nowrap; }
+.tip-formula { display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+.fraction { display:inline-flex; flex-direction:column; text-align:center; min-width:0; max-width:100%; }
+/* 公式文案换行兜底：超长分子（如 ICU-18）折行显示，不再撑出浮框 */
+.numerator, .denominator { padding:2px 8px; font-size:12px; white-space:normal; overflow-wrap:break-word; }
 .fraction-line { height:1px; background:var(--text-main); }
 .multiplier { font-size:12px; color:var(--brand); }
 .tip-special .special-line { font-size:12px; line-height:1.8; color:var(--text-main); }

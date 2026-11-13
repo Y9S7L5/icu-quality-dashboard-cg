@@ -243,7 +243,9 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 39  # 明细住院号 patient_id 改 mrn 优先（原 hisPid 优先；本院两套编号）旧缓存作废
+CACHE_VERSION = 40  # ICU-15 分母只取转出类型「转出」（2026-11 院方口径；出院/死亡/缺失不计）；
+                    #      ICU-18 命中依据改诊断名称（查 VI_ICU_ICD 字典，原纯 ICD 码）；旧缓存作废
+                    # v39: 明细住院号 patient_id 改 mrn 优先（原 hisPid 优先；本院两套编号）
                     #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
                     #      (ICU血气/细菌培养/血培养鉴定/抗生素,6h 窗另需血气复查≥2)
                     #      旧明细(三道门口径)作废
@@ -696,7 +698,7 @@ SOURCE_DESC = {
     "ICU-12": {"numerator": "非计划自行拔除气管导管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
     "ICU-13": {"numerator": "气管插管拔除后48小时内重新插管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
     "ICU-14": {"numerator": "非计划由手术室/病房转入ICU的患者数", "denominator": "同期手术后入ICU患者的总人数"},
-    "ICU-15": {"numerator": "转出ICU后48小时内再次因同一/新发病情收治入ICU的患者数", "denominator": "同期转出ICU的患者总人数"},
+    "ICU-15": {"numerator": "转出ICU后48小时内再次因同一/新发病情收治入ICU的患者数", "denominator": "同期转出ICU（出科类型=转出，不含出院/死亡）的患者总人数"},
     "ICU-16": {"numerator": "新发生呼吸机相关性肺炎(VAP)的例次数", "denominator": "有创呼吸机累计使用总天数"},
     "ICU-17": {"numerator": "新发生中心导管相关血流感染(CRBSI)的例次数", "denominator": "中心血管导管患者-导管日：同一患者同一日存在≥1根中心静脉导管/PICC/中心静脉透析或CRRT通路计1日；动脉导管、PICCO、中长导管等非中心导管不计入；置管日与拔管日均按占用日历日计入"},
     "ICU-18": {"numerator": "有APACHEⅡ评分(视为已行意识评估GCS)的急性脑损伤患者数", "denominator": "同期收治的急性脑损伤(ICD编码清单命中)患者总数"},
@@ -1194,8 +1196,10 @@ def _enrich_admission_discharge(items, dept_codes):
     for it in items:
         mid = it.get("mrn") or it.get("patient_id") or it.get("hisPid") or ""
         info = lookup.get(str(mid), {})
-        it["admission_type"] = info.get("admission_type", "")
-        it["discharge_type"] = info.get("discharge_type", "")
+        # admission_type/discharge_type：分支已带事件级值（ICU-05 v3、ICU-15 按事件过滤「转出」）
+        # 时不覆盖——同 mrn 多条在科记录时 mrn 查找可能命中别的 stay
+        it["admission_type"] = it.get("admission_type") or info.get("admission_type", "")
+        it["discharge_type"] = it.get("discharge_type") or info.get("discharge_type", "")
         it["bed_physician"] = info.get("bed_physician", "")
         it["icu_out_time"] = info.get("icu_out_time", "")
         # icu_in_time：分支已带 stay 级入科时间（人次口径多次入科更准）时不覆盖
@@ -1991,6 +1995,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "icuDischargeTime": discharge_text,
                 "reIcuAdmissionTime": re_admit_text,
                 "event_source": source_text,
+                "discharge_type": p.get("discharge_type", ""),
                 "basis": basis,
                 "value": 1,
             })
@@ -3209,6 +3214,16 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
                     p["admit_time"] = f"统计 {total_days} 天"
     else:
         items = _detail_cache_payload(code, period, part, icu_unit, nocache=nocache)
+
+    # 详情统一排序（2026-11）：先按入科类型分组 入院 → 转入 → 其他/缺失，
+    # 组内按入科时间升序（缺失时间排组内最后）；稳定排序，医护/汇总等
+    # 无类型无时间的行保持原有相对顺序。展示与明细导出同用此顺序。
+    _adm_order = {"入院": 0, "转入": 1}
+    items = sorted(items, key=lambda p: (
+        _adm_order.get((p.get("admission_type") or "").strip(), 2),
+        0 if p.get("icu_in_time") else 1,
+        p.get("icu_in_time") or "",
+    ))
 
     # 各指标明细描述
     # ICU-05: 附加原因分布（#设计: 三色语义 — 红=明确未达标 / 橙=顺序问题 / 灰=数据缺失）
