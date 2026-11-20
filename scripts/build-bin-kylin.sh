@@ -52,11 +52,24 @@ deploy/kylin-v11/make-base-image.sh 自制 kylin-server:v11 后重跑。"
 log "使用基础镜像: $BASE_IMAGE"
 
 # 3) 编译
+# DOCKER_CACHE_ARGS：CI 传 buildx GHA 层缓存（--cache-from/--cache-to type=gha，
+# 需先跑 docker/setup-buildx-action 建 container 驱动 builder）。
+# 本地不传 → 走原普通 build，行为不变（podman 兼容）。
 log "编译二进制（首次约 3-6 分钟）"
-"$ENGINE" build \
-  --build-arg BASE_IMAGE="$BASE_IMAGE" \
-  --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
-  -t "$IMAGE_NAME" -f "$DOCKERFILE" .
+# shellcheck disable=SC2206
+CACHE_ARGS=(${DOCKER_CACHE_ARGS:-})
+if [ ${#CACHE_ARGS[@]} -gt 0 ]; then
+  "$ENGINE" buildx build \
+    "${CACHE_ARGS[@]}" \
+    --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
+    -t "$IMAGE_NAME" -f "$DOCKERFILE" .
+else
+  "$ENGINE" build \
+    --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
+    -t "$IMAGE_NAME" -f "$DOCKERFILE" .
+fi
 
 # 4) 取出唯一产物
 mkdir -p "$OUT_DIR"

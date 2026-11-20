@@ -36,7 +36,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 2026-11-20 曾因 openEuler 源元数据下载劣化，dnf 层静默 30 分钟被 30min 上限
+    # 杀掉（run #7；#5 同因已拖到 17min）。放宽到 90min 兜底。
+    timeout-minutes: 90
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -44,13 +46,20 @@ jobs:
       - name: 安装 Node.js（构建前端用）
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: icu-quality-dashboard/package-lock.json
+
+      # docker 层缓存（GHA cache）：dnf/pip 等只在依赖变化时重建，
+      # 命中后不再受 openEuler/PyPI 源速度波动影响，构建回到 4~6 分钟
+      - name: 准备 buildx（GHA 层缓存）
+        uses: docker/setup-buildx-action@v3
 
       - name: 构建前端 + 麒麟单文件二进制
         # bash 显式调用：不依赖 git 可执行位（Windows 提交易丢 mode）
         run: SYNC_FRONTEND=1 bash ./scripts/build-bin-kylin.sh
+        env:
+          DOCKER_CACHE_ARGS: --cache-from type=gha --cache-to type=gha,mode=max
 
       - name: 打发布包
         run: |
