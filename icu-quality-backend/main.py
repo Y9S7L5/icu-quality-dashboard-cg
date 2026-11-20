@@ -227,13 +227,15 @@ def _cache_get(key, nocache: bool = False):
     if nocache:
         return None
     entry = _cache.get(key)
-    if entry and time_module.time() - entry["ts"] < _CACHE_TTL:
+    # ttl 支持按条目覆盖（如按年查询计算成本高，缓存久一些）
+    ttl = entry.get("ttl", _CACHE_TTL) if entry else _CACHE_TTL
+    if entry and time_module.time() - entry["ts"] < ttl:
         return entry["val"]
     return None
 
 
-def _cache_set(key, val):
-    _cache[key] = {"val": val, "ts": time_module.time()}
+def _cache_set(key, val, ttl: int = None):
+    _cache[key] = {"val": val, "ts": time_module.time(), "ttl": ttl or _CACHE_TTL}
 
 
 def _cache_clear():
@@ -406,14 +408,32 @@ def _trigger_summary_rebuild(dept_codes, periods, indicators=None):
         logger.error("Summary rebuild failed for %s/%s: %s\n%s", dept_codes, periods, e, traceback.format_exc())
 
 
-def _get_exclusion_map(dept_codes, period, code):
+def _get_exclusion_map(dept_codes, period, code, end_period=None):
+    # end_period：统计窗口结束期（YYYY-MM）。跨月时（按年查询）取区间内
+    # 全部月份的人工排除并集，与 summary.apply_exclusions 同口径。
+    periods = [period]
+    if end_period and end_period != period:
+        try:
+            y1, m1 = map(int, period.split("-"))
+            y2, m2 = map(int, end_period.split("-"))
+            while (y1, m1) <= (y2, m2):
+                p = f"{y1}-{m1:02d}"
+                if p not in periods:
+                    periods.append(p)
+                m1 += 1
+                if m1 > 12:
+                    m1 = 1
+                    y1 += 1
+        except Exception:
+            pass
     dept_key = _dept_cache_key(dept_codes)
     for db_name in BED_DB_NAMES:
         try:
             db = get_client(db_name)[db_name]
             coll = db[EXCLUSION_COLLECTION]
             docs = list(coll.find(
-                {"dept_code": dept_key, "period": period, "code": code, "excluded": True},
+                {"dept_code": dept_key, "period": {"$in": periods},
+                 "code": code, "excluded": True},
                 {"exclusion_key": 1, "reason_code": 1, "reason_text": 1, "operator": 1, "_id": 0}
             ))
             return {d["exclusion_key"]: d for d in docs}
@@ -542,7 +562,8 @@ def _write_detail_cache(dept_codes: list, period: str, code: str, part: str, ite
     )
 
 
-def _detail_cache_payload(code: str, period: str, part: str, icu_unit: str, nocache: bool = False):
+def _detail_cache_payload(code: str, period: str, part: str, icu_unit: str,
+                          nocache: bool = False, end_date: str = ""):
     # ICU-00：前端固定用 numerator/denominator 下钻，映射到患者动态真实口径 ——
     # 分子=期初原有(carry_in)、分母=同期患者总数(total=原有+新入)，与公式条同口径。
     # 缓存键随之用 census part，可直接命中 rebuild_detail_cache 预计算的 carry_in，
@@ -551,6 +572,10 @@ def _detail_cache_payload(code: str, period: str, part: str, icu_unit: str, noca
     if code == "ICU-00":
         part = {"numerator": "carry_in", "denominator": "total"}.get(part, part)
     dept_codes = _resolve_dept_codes(icu_unit)
+    # 按年窗口（end_date 跨月）不读写单月明细缓存：其键是单月 period，会命中
+    # 同月数据；整年明细按需实时算，外层 indicator_detail 有 60s 进程缓存兜底。
+    if end_date and end_date[:7] != period:
+        return query_detail(code, period, part, icu_unit, end_date=end_date)
     if _is_historical_period(period) and not nocache:
         cached = _read_detail_cache(dept_codes, period, code, part)
         if cached is not None:
@@ -1229,18 +1254,21 @@ def _score_cell(v):
     return int(f) if f.is_integer() else round(f, 1)
 
 
-def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
+def query_detail(code: str, period: str, part: str, icu_unit: str = "all", end_date: str = ""):
     """
     第三级：明细数据。
     ICU-01 分子 → 患者明细（含在床天数）
     ICU-01 分母 → 床位配置明细
     其他指标 → 患者明细
+    end_date：可选，窗口结束日 YYYY-MM-DD。按年查询传 Y-12-31，
+    整年窗口一次取数（与按年公式条同窗口），不逐月合并。
     """
     import calendar
     year, month = period.split("-")
     start_date = f"{year}-{month}-01"
-    end_day = calendar.monthrange(int(year), int(month))[1]
-    end_date = f"{year}-{month}-{end_day:02d}"
+    if not end_date:
+        end_day = calendar.monthrange(int(year), int(month))[1]
+        end_date = f"{year}-{month}-{end_day:02d}"
 
     from datetime import datetime as dt, timedelta
     # 入口一次性转 UTC 帧：下游 Mongo 查询/比较自动同帧
@@ -1326,7 +1354,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "exclusion_key": p.get("exclusion_key", "") or _ek_map.get(p.get("pid", ""), ""),
                     "pid_ref": p.get("pid", ""),
                 })
-            excl_map = _get_exclusion_map(dept_codes, period, code)
+            excl_map = _get_exclusion_map(dept_codes, period, code, end_period=end_date[:7])
             for item in items:
                 ek = item.get("exclusion_key", "")
                 if ek in excl_map:
@@ -1360,7 +1388,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                     "exclusion_key": p.get("exclusion_key", ""),
                     "pid_ref": p.get("pid", ""),
                 })
-            excl_map = _get_exclusion_map(dept_codes, period, code)
+            excl_map = _get_exclusion_map(dept_codes, period, code, end_period=end_date[:7])
             for item in items:
                 ek = item.get("exclusion_key", "")
                 if ek in excl_map:
@@ -1642,7 +1670,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
 
         hour = code.split("-")[2]  # '1h', '3h', '6h'
         key = f"h{hour[0]}_patients"
-        excl_map = _get_exclusion_map(dept_codes, period, code)
+        excl_map = _get_exclusion_map(dept_codes, period, code, end_period=end_date[:7])
         if part == "numerator":
             items = []
             for p in data.get(key, []):
@@ -2873,13 +2901,121 @@ def dashboard_command_center(period: str, end_period: str = "", icu_unit: str = 
         "last_rebuilt_at": last_rebuilt_at,
     }
 
+# ---- 按年查询：全窗口实时计算 ----
+# 口径（2026-11）：不逐月累加。同期ICU患者总数 = 1月原有 + 1~12月新收，
+# 即 get_patient_census(Y-01-01, Y-12-31) 的 carry_in + new_admit —— 各指标
+# 统计函数直接以整年为窗口取数，时点/在科人次类指标不再重复计数跨月患者。
+_YEAR_ROW_FIELDS = (
+    "candidate_mode", "raw_candidate_count", "high_probability_count",
+    "probable_count", "pending_review_count", "not_candidate_count",
+    "diagnosis_based_count", "candidate_den",
+    "raw_num", "raw_den", "excluded_num", "excluded_den",
+    "new_shock_count", "old_shock_count", "shock_diff",
+)
+
+
+def _year_row_from_compute(code: str, result: dict, year: int) -> dict:
+    """把 INDICATOR_COMPUTERS 的整年计算结果转成列表 API 行（单列：months=[年]）。"""
+    if not result or not result.get("data_available", True):
+        row = _empty_indicator_row(code)
+    else:
+        doc = {
+            "indicator": code,
+            "numerator": result.get("num", 0),
+            "denominator": result.get("den", 0),
+            "value": result.get("val"),
+        }
+        if result.get("census"):
+            doc["census"] = result["census"]
+        for df in _YEAR_ROW_FIELDS:
+            if result.get(df) is not None:
+                doc[df] = result[df]
+        row = _summary_row_to_api(doc)
+    row.update({
+        "months": [str(year)],
+        "monthly": [row.get("value")],
+        "data_complete": True,
+        "missing_periods": [],
+        "aggregation_periods": [str(year)],
+    })
+    return row
+
+
+def _compute_year_rows(year: int, icu_unit: str) -> list:
+    """按年查询：全部指标以 Y-01-01 ~ Y-12-31 为窗口并行实时计算。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    dept_codes = _resolve_dept_codes(icu_unit)
+    start, end = f"{year}-01-01", f"{year}-12-31"
+    computers = dict(summary_module.INDICATOR_COMPUTERS)
+
+    # ICU-05 依赖血管活性药物宽标签（与单月实时兜底同逻辑）
+    try:
+        from scoring.bundle_engine import set_vaso_wide_labels
+        sc = get_client("SmartCare")["SmartCare"]
+        vaso_drugs = list(sc.configDrug.find(
+            {"classification": {"$regex": "血管活性", "$options": "i"}},
+            {"name": 1, "_id": 0},
+        ))
+        labels = {d["name"].strip() for d in vaso_drugs if d.get("name")}
+        if labels:
+            set_vaso_wide_labels(labels)
+    except Exception:
+        pass
+
+    def _one(code: str):
+        try:
+            return code, computers[code](dept_codes, start, end), None
+        except Exception as e:
+            return code, None, e
+
+    rows_by_code = {}
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(computers)))) as ex:
+        futures = [ex.submit(_one, code) for code in computers]
+        for fut in as_completed(futures):
+            code, result, err = fut.result()
+            if err is not None:
+                logger.warning("year compute failed for %s: %s", code, err)
+                rows_by_code[code] = _empty_indicator_row(code)
+            else:
+                rows_by_code[code] = _year_row_from_compute(code, result, year)
+
+    # 与单月/跨月路径对齐：补全配置里存在但无计算函数的编码
+    for code in UNIT_MAP:
+        if code not in rows_by_code:
+            row = _empty_indicator_row(code)
+            row.update({
+                "months": [str(year)],
+                "monthly": [None],
+                "data_complete": True,
+                "missing_periods": [],
+                "aggregation_periods": [str(year)],
+            })
+            rows_by_code[code] = row
+
+    result = sorted(rows_by_code.values(), key=lambda x: x.get("code", ""))
+    return _ensure_no_data_indicator_rows(result)
+
+
 @app.get("/api/indicators/list")
-def indicator_list(period: str, icu_unit: str = "all", end_period: str = "", nocache: bool = False):
+def indicator_list(period: str, icu_unit: str = "all", end_period: str = "",
+                   nocache: bool = False, by_year: bool = False):
     """
     第一级：指标汇总列表。
     period=2026-06 单月, period=2026-01&end_period=2026-06 跨月汇总。
+    by_year=true 按年查询：period 取其中年份，整年窗口实时计算，返回单列。
     nocache=true 强制刷新，绕过服务器缓存。
     """
+    if by_year:
+        year = int(period.split("-")[0])
+        ck = _cache_key("list_year", year, icu_unit)
+        cached = _cache_get(ck, nocache=nocache)
+        if cached is not None:
+            return cached
+        result = _compute_year_rows(year, icu_unit)
+        # 整年实时计算成本高（ICU-05 等全量判定），缓存 5 分钟
+        _cache_set(ck, result, ttl=300)
+        return result
+
     ck = _cache_key("list", period, icu_unit, end_period)
     cached = _cache_get(ck, nocache=nocache)
     if cached is not None:
@@ -3149,15 +3285,22 @@ def export_report_values(period: str, icu_unit: str = "all", nocache: bool = Fal
 
 @app.get("/api/indicators/{code}/detail")
 def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", end_period: str = "",
-                     nocache: bool = False, limit: int = 200, offset: int = 0):
+                     nocache: bool = False, limit: int = 200, offset: int = 0,
+                     by_year: bool = False):
     """
     第三级：分子/分母下钻明细。
     支持 end_period 跨月聚合。
+    by_year=true 按年下钻：整年窗口（Y-01-01~Y-12-31）一次取数，与按年公式条
+    同窗口（同期ICU患者总数=1月原有+全年新收），不逐月合并。
     nocache=true 强制刷新。
     """
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
-    ck = _cache_key("detail", code, period, part, icu_unit, end_period)
+    if by_year:
+        # 归一到整年窗口：period 只取年份，start=1月、end=12月
+        period = f"{period.split('-')[0]}-01"
+        end_period = ""
+    ck = _cache_key("detail_year" if by_year else "detail", code, period, part, icu_unit, end_period)
     cached = _cache_get(ck, nocache=nocache)
     if cached is not None:
         result = dict(cached)
@@ -3169,8 +3312,13 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         result["patients"] = all_items[offset:offset + limit]
         result.pop("all_patients", None)
         return result
+    # 按年：整年窗口取数（与按年公式条同窗口）
+    if by_year:
+        year = period.split("-")[0]
+        items = _detail_cache_payload(code, period, part, icu_unit,
+                                      nocache=nocache, end_date=f"{year}-12-31")
     # 跨月汇总
-    if end_period:
+    elif end_period:
         start_y, start_m = period.split("-")
         end_y, end_m = end_period.split("-")
         months = []
@@ -3353,8 +3501,9 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
             _icu11_den_rows = items
         else:
             try:
-                _icu11_den_rows = _detail_cache_payload(code, period, "denominator",
-                                                        icu_unit, nocache=nocache)
+                _icu11_den_rows = _detail_cache_payload(
+                    code, period, "denominator", icu_unit, nocache=nocache,
+                    end_date=f"{period.split('-')[0]}-12-31" if by_year else "")
             except Exception:
                 _icu11_den_rows = []
         _icu11_total = len(_icu11_den_rows)
@@ -3429,7 +3578,8 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         result["reason_summary"] = reason_summary
     if extra is not None:
         result["extra"] = extra
-    _cache_set(ck, result)
+    # 按年明细首次为整年实时计算（较慢），与按年列表同缓存 5 分钟
+    _cache_set(ck, result, ttl=300 if by_year else None)
     paged = dict(result)
     paged["limit"] = limit
     paged["offset"] = offset

@@ -264,6 +264,8 @@ const props = defineProps({
   funnel: { type: Object, default: null },
   period: { type: String, default: '' },
   endPeriod: { type: String, default: '' },
+  // 按年查询上下文：导出续拉分页时保持整年窗口（与列表公式条同窗口）
+  byYear: { type: Boolean, default: false },
   unit: { type: String, default: 'all' },
   unitName: { type: String, default: '' },
 });
@@ -496,6 +498,7 @@ async function handleExport() {
       part: d.part,
       period: props.period,
       endPeriod: props.endPeriod,
+      byYear: props.byYear,
       unit: props.unit,
       unitName: props.unitName,
       sourceDesc: d.source_desc,

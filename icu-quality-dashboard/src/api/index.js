@@ -35,10 +35,12 @@ export async function fetchCommandCenter(period, endPeriod = '', icuUnit = 'all'
 }
 
 // ---- 指标明细列表（含分子/分母） ----
-export async function fetchIndicatorList(period, icuUnit = 'all', endPeriod = '', nocache = false) {
+// byYear=true：按年查询，period 传 YYYY-01，后端整年窗口实时计算并返回单列
+export async function fetchIndicatorList(period, icuUnit = 'all', endPeriod = '', nocache = false, byYear = false) {
   let url = `${BASE}/indicators/list?period=${period}&icu_unit=${encodeURIComponent(icuUnit)}`;
   if (endPeriod) url += `&end_period=${endPeriod}`;
   if (nocache) url += `&nocache=true`;
+  if (byYear) url += `&by_year=true`;
   const res = await fetch(url);
   return res.json();
 }
@@ -65,11 +67,13 @@ export async function fetchReportValues(period, unit = 'all') {
 }
 
 // ---- 分子/分母下钻明细 ----
+// options.byYear=true：按年下钻，整年窗口一次取数（与按年公式条同窗口）
 export async function fetchDetail(code, period, part, icuUnit = 'all', endPeriod = '', options = {}) {
   let url = `${BASE}/indicators/${code}/detail?period=${period}&part=${part}&icu_unit=${encodeURIComponent(icuUnit)}`;
   if (endPeriod) url += `&end_period=${endPeriod}`;
   if (options.limit) url += `&limit=${options.limit}`;
   if (options.offset) url += `&offset=${options.offset}`;
+  if (options.byYear) url += '&by_year=true';
   if (['ICU-12', 'ICU-13'].includes(code)) url += '&nocache=true';
   const res = await fetch(url);
   if (!res.ok) {

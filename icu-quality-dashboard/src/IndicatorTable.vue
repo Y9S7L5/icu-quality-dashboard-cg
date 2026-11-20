@@ -5,13 +5,20 @@
       <span class="page-title">{{ deptName }}</span>
       <div class="filters">
         <select v-model="year" @change="reload()"><option v-for="y in years" :key="y" :value="y">{{ y }}年</option></select>
-        <select v-model="startMonth" @change="reload()"><option v-for="m in 12" :key="m" :value="m">{{ m }}月</option></select>
+        <select v-model="startMonth" :title="byYear ? '按年查询中，修改月份将恢复按月查询' : ''"
+                @change="onMonthChange"><option v-for="m in 12" :key="m" :value="m">{{ m }}月</option></select>
         <span class="dash">—</span>
-        <select v-model="endMonth" @change="reload()"><option v-for="m in 12" :key="m" :value="m">{{ m }}月</option></select>
+        <select v-model="endMonth" :title="byYear ? '按年查询中，修改月份将恢复按月查询' : ''"
+                @change="onMonthChange"><option v-for="m in 12" :key="m" :value="m">{{ m }}月</option></select>
 
         <button class="refresh-btn" :disabled="refreshing" @click="triggerRefresh">
           <span v-if="refreshing" class="spinner"></span>
           {{ refreshing ? '后台刷新中' : '刷新数据' }}
+        </button>
+        <button class="year-btn" :class="{ active: byYear }"
+                :title="byYear ? '当前按年查询，点击恢复按月查询' : '按所选年份整年查询，表格只展示一列'"
+                @click="toggleByYear">
+          {{ byYear && rowsLoading ? '按年查询中…' : (byYear ? `按年查询 · ${year}年` : '按年查询') }}
         </button>
         <button class="guide-btn" @click="guideVisible=true">指标说明</button>
         <button class="export-btn" @click="exportCsv">导出CSV</button>
@@ -20,27 +27,29 @@
       </div>
     </div>
 
-    <!-- 患者动态摘要条 -->
-    <div v-if="census" class="census-bar">
-      <span class="census-label">患者动态</span>
-      <span class="census-item clickable" @click="drillCensus('carry_in', '原有患者')">
-        <small>原有</small> <b>{{ census.carry_in }}</b>
-      </span>
-      <span class="census-item clickable" @click="drillCensus('new_admit', '新入患者')">
-        <small>新入</small> <b>{{ census.new_admit }}</b>
-      </span>
-      <span class="census-item clickable" @click="drillCensus('discharge', '出科患者')">
-        <small>出科</small> <b>{{ census.discharge }}</b>
-      </span>
-      <span class="census-item clickable" @click="drillCensus('carry_out', '期末在科')">
-        <small>期末在科</small> <b>{{ census.carry_out }}</b>
-      </span>
-      <span class="census-item total">
-        <small>同期总数</small> <b>{{ census.total }}</b>
-      </span>
-    </div>
+    <!-- 数据区：计算/刷新期间由遮罩盖住，禁止点按指标数据 -->
+    <div class="data-area">
+      <!-- 患者动态摘要条 -->
+      <div v-if="census" class="census-bar">
+        <span class="census-label">患者动态</span>
+        <span class="census-item clickable" @click="drillCensus('carry_in', '原有患者')">
+          <small>原有</small> <b>{{ census.carry_in }}</b>
+        </span>
+        <span class="census-item clickable" @click="drillCensus('new_admit', '新入患者')">
+          <small>新入</small> <b>{{ census.new_admit }}</b>
+        </span>
+        <span class="census-item clickable" @click="drillCensus('discharge', '出科患者')">
+          <small>出科</small> <b>{{ census.discharge }}</b>
+        </span>
+        <span class="census-item clickable" @click="drillCensus('carry_out', '期末在科')">
+          <small>期末在科</small> <b>{{ census.carry_out }}</b>
+        </span>
+        <span class="census-item total">
+          <small>同期总数</small> <b>{{ census.total }}</b>
+        </span>
+      </div>
 
-    <div class="table-wrap" :class="{ 'multi-month': isMultiMonth }">
+      <div class="table-wrap" :class="{ 'multi-month': isMultiMonth }">
       <table class="indi-table">
         <colgroup>
           <col class="c-code" />
@@ -49,6 +58,7 @@
           <col class="c-num" />
           <col class="c-num" />
           <col class="c-val" />
+          <col v-if="byYear" class="c-month" />
           <col v-for="m in monthCols" :key="'col'+m" class="c-month" />
           <col class="c-status" />
           <col class="c-trend" />
@@ -61,6 +71,7 @@
             <th class="t-right">分子</th>
             <th class="t-right">分母</th>
             <th class="t-right sep">比值</th>
+            <th v-if="byYear" class="t-center">{{ year }}年</th>
             <th v-for="m in monthCols" :key="'h'+m" class="t-center">{{ m }}月</th>
             <th class="t-center sep">状态</th>
             <th class="t-center">趋势</th>
@@ -78,6 +89,7 @@
             <td class="num t-right link" @click="drillDetail(row,'numerator')">{{ fmtCell(row.numerator) }}</td>
             <td class="num t-right link" @click="drillDetail(row,'denominator')" :title="census ? '= 原有 ' + census.carry_in + ' + 新入 ' + census.new_admit : ''">{{ fmtCell(row.denominator) }}</td>
             <td class="t-right sep link" @click="drillTrend(row)"><b class="val">{{ fmtValue(row) }}</b></td>
+            <td v-if="byYear" class="t-center month-cell link" @click="drillYearDetail(row)">{{ fmtValue(row) }}</td>
             <td v-for="m in monthCols" :key="row.code+m" class="t-center month-cell link" :class="cellLevel(row, m)"
                 @click="drillMonthDetail(row, m)">
               {{ fmtMonth(row, m) }}
@@ -92,6 +104,17 @@
           </tr>
         </tbody>
       </table>
+      </div>
+
+      <!-- 计算加载遮罩：按年查询 / 刷新数据 / 加载期间盖住数据区 -->
+      <Transition name="toast-fade">
+        <div v-if="showOverlay" class="load-overlay">
+          <div class="load-box">
+            <span class="spinner load-spinner"></span>
+            <span class="load-text">{{ loadingText }}</span>
+          </div>
+        </div>
+      </Transition>
     </div>
 
     <!-- 公式悬浮 -->
@@ -116,7 +139,8 @@
     <Modal v-if="detailData" :title="detailTitle" @close="detailData=null">
       <DetailModal :data="detailData" :summary="detailData.summary" :parts="detailData.parts"
                    :funnel="detailData.funnel"
-                   :period="period" :end-period="isMultiMonth ? periodEnd : ''" :unit="unit" :unit-name="deptName"
+                   :period="drillPeriod" :end-period="drillEndPeriod" :unit="unit" :unit-name="deptName"
+                   :by-year="byYear"
                    @exclusion-changed="onDetailExclusionChanged" />
     </Modal>
     <!-- 月份单元格下钻弹窗：独立查询上下文（分子/分母切换由 DetailModal 内部处理） -->
@@ -153,6 +177,8 @@ const _curYear = _shanghaiNow.getFullYear();
 const _curMonth = _shanghaiNow.getMonth() + 1;
 
 const year = ref(_curYear), startMonth = ref(_curMonth), endMonth = ref(_curMonth);
+// 按年查询：整年一列（同期ICU患者总数 = 1月原有 + 1~12月新收），月份选择器停用
+const byYear = ref(false);
 const hostDeptCode = inject('hostDeptCode', ref('all'));
 const unit = computed(() => hostDeptCode.value || 'all');
 // 动态年份：从2024到当前年+1
@@ -181,6 +207,7 @@ let _refreshPollTimer = null;
 const activeRefreshTask = ref(null);
 
 const monthCols = computed(() => {
+  if (byYear.value) return []; // 按年查询只展示年份单列，不渲染各月列
   if (startMonth.value === endMonth.value) return [];
   const arr = []; for (let m = startMonth.value; m <= endMonth.value; m++) arr.push(m);
   return arr;
@@ -188,6 +215,24 @@ const monthCols = computed(() => {
 const isMultiMonth = computed(() => monthCols.value.length > 0);
 const period = computed(() => `${year.value}-${String(startMonth.value).padStart(2,'0')}`);
 const periodEnd = computed(() => `${year.value}-${String(endMonth.value).padStart(2,'0')}`);
+// 下钻明细的查询窗口：按年 = 整年单窗口（by_year 标志走整年取数，end_period 留空）；
+// 跨月 = 起止月；单月 = 无 end_period
+const drillPeriod = computed(() => byYear.value ? `${year.value}-01` : period.value);
+const drillEndPeriod = computed(() => {
+  if (byYear.value) return '';
+  return isMultiMonth.value ? periodEnd.value : '';
+});
+
+// 计算加载遮罩：按年查询整年计算、刷新数据（含收尾重载）期间盖住数据区
+const showOverlay = computed(() => refreshing.value || (byYear.value && rowsLoading.value));
+const loadingText = computed(() => {
+  if (refreshing.value) {
+    const t = activeRefreshTask.value;
+    if (t?.done != null && t?.total) return `后台刷新中 ${t.done}/${t.total}…`;
+    return '后台刷新中…';
+  }
+  return '按年查询计算中…';
+});
 
 function fmtMonth(row, m) {
   const v = row.monthly?.[m];
@@ -262,6 +307,10 @@ function hideTip(){ tip.value.show=false; }
 
 // ===== 真实 API 数据加载 =====
 async function reload(nocache = false) {
+  if (byYear.value) {
+    // 按年查询：只用年份，整年一列
+    return reloadRange(`${year.value}-01`, '', nocache);
+  }
   // 校验：开始月份不能晚于结束月份
   if (startMonth.value > endMonth.value) {
     endMonth.value = startMonth.value;
@@ -269,17 +318,37 @@ async function reload(nocache = false) {
   return reloadRange(period.value, isMultiMonth.value ? periodEnd.value : '', nocache);
 }
 
+function toggleByYear() {
+  byYear.value = !byYear.value;
+  selectedRow.value = null;
+  closeMonthDetail();
+  detailData.value = null;
+  reload(false); // 按年结果后端缓存 5 分钟，来回切换不重复整年重算
+}
+
+// 修改月份：若正处于按年查询，先退出按年再按所选月份重新加载（恢复按月查询）
+function onMonthChange() {
+  if (byYear.value) {
+    byYear.value = false;
+    selectedRow.value = null;
+    closeMonthDetail();
+    detailData.value = null;
+  }
+  reload();
+}
+
 let rangeSeq = 0; // 列表请求序号：期间快速切换时丢弃过期响应
 
 async function reloadRange(startPeriod, endPeriod = '', nocache = false) {
   const seq = ++rangeSeq;
+  const isYearQuery = byYear.value; // 捕获请求时的模式，响应按其形状解析
   rowsLoading.value = true;
   try {
-    const data = await fetchIndicatorList(startPeriod, unit.value, endPeriod, nocache);
+    const data = await fetchIndicatorList(startPeriod, unit.value, endPeriod, nocache, isYearQuery);
     if (seq !== rangeSeq) return; // 已有更新的请求，本响应作废
-    // 后端返回 monthly 是数组，转换为 {月份: 值} 对象
+    // 后端返回 monthly 是数组，转换为 {月份: 值} 对象（按年查询只有单列，不拆月）
     rows.value = data.sort((a, b) => codeOrder(a.code) - codeOrder(b.code)).map(r => {
-      if (r.months && r.monthly) {
+      if (!isYearQuery && r.months && r.monthly) {
         const map = {};
         r.months.forEach((mon, i) => { map[parseInt(mon.split('-')[1])] = r.monthly[i]; });
         r.monthly = map;
@@ -297,15 +366,17 @@ async function reloadRange(startPeriod, endPeriod = '', nocache = false) {
 
 async function drillTrend(row) {
   if (row.value == null) return;
-  try { trendData.value = await apiFetchTrend(row.code, year.value, unit.value, startMonth.value, endMonth.value); } catch { /* */ }
+  // 按年查询：趋势固定展示整年 1~12 月
+  const sm = byYear.value ? 1 : startMonth.value;
+  const em = byYear.value ? 12 : endMonth.value;
+  try { trendData.value = await apiFetchTrend(row.code, year.value, unit.value, sm, em); } catch { /* */ }
 }
 async function drillCensus(part, label) {
   if (rowsLoading.value) return;
-  const endP = isMultiMonth.value ? periodEnd.value : '';
   const base = { code: 'ICU-00', name: label, part, count: 0, source_desc: '明细加载中...', patients: [], loading: true };
   detailData.value = base;
   try {
-    detailData.value = await apiFetchDetail('ICU-00', period.value, part, unit.value, endP, { limit: 200, offset: 0 });
+    detailData.value = await apiFetchDetail('ICU-00', drillPeriod.value, part, unit.value, drillEndPeriod.value, { limit: 200, offset: 0, byYear: byYear.value });
   } catch (e) {
     detailData.value = { ...base, loading: false, error: e.message || '明细加载失败', source_desc: '明细加载失败' };
   }
@@ -314,14 +385,14 @@ async function drillDetail(row, part) {
   if (rowsLoading.value) return;
   if (row[part] == null) return;
   const seq = ++drillSeq;
-  const endP = isMultiMonth.value ? periodEnd.value : '';
+  const endP = drillEndPeriod.value;
   const base = { code: row.code, name: row.name, part, count: 0, source_desc: '明细加载中...', patients: [], loading: true };
   // 公式条/漏斗在加载期间即显示
   detailData.value = { ...base, summary: buildSummary(row), funnel: buildFunnel(row) };
   try {
     const [numR, denR] = await Promise.all([
-      apiFetchDetail(row.code, period.value, 'numerator', unit.value, endP, { limit: 200, offset: 0 }),
-      apiFetchDetail(row.code, period.value, 'denominator', unit.value, endP, { limit: 200, offset: 0 }),
+      apiFetchDetail(row.code, drillPeriod.value, 'numerator', unit.value, endP, { limit: 200, offset: 0, byYear: byYear.value }),
+      apiFetchDetail(row.code, drillPeriod.value, 'denominator', unit.value, endP, { limit: 200, offset: 0, byYear: byYear.value }),
     ]);
     if (seq !== drillSeq) return;
     const clicked = part === 'numerator' ? numR : denR;
@@ -414,6 +485,14 @@ async function drillMonthDetail(row, m) {
   }
 }
 
+// 按年查询的年份单元格下钻：整年窗口（Y-01 ~ Y-12）的分子/分母明细
+function drillYearDetail(row) {
+  if (rowsLoading.value) return;
+  const part = row.numerator != null ? 'numerator' : 'denominator';
+  if (row[part] == null) return;
+  drillDetail(row, part);
+}
+
 // 分子/分母切换已内置于 DetailModal（parts prop），无需外部维护当前 part
 
 const detailTitle = computed(()=> detailData.value ? `${detailData.value.name} · 明细` : '');
@@ -449,10 +528,10 @@ function onMonthExclusionChanged(part) {
 
 function onDetailExclusionChanged(part) {
   if (!detailData.value) return;
-  const endP = isMultiMonth.value ? periodEnd.value : '';
+  const endP = drillEndPeriod.value;
   const cur = detailData.value;
   reloadBothParts(
-    (p) => apiFetchDetail(cur.code, period.value, p, unit.value, endP, { limit: 200, offset: 0 }),
+    (p) => apiFetchDetail(cur.code, drillPeriod.value, p, unit.value, endP, { limit: 200, offset: 0, byYear: byYear.value }),
     part || cur.part,
     cur,
     (next) => { detailData.value = next; },
@@ -495,8 +574,9 @@ async function triggerRefresh() {
   }  // 防重复点击
   refreshing.value = true;
   const refreshYear = year.value;
-  const refreshStartMonth = startMonth.value;
-  const refreshEndMonth = endMonth.value;
+  // 按年查询模式：刷新整年 12 个月的预聚合（下钻明细按月缓存依赖它）
+  const refreshStartMonth = byYear.value ? 1 : startMonth.value;
+  const refreshEndMonth = byYear.value ? 12 : endMonth.value;
   const refreshStartPeriod = `${refreshYear}-${String(refreshStartMonth).padStart(2, '0')}`;
   const refreshEndPeriod = `${refreshYear}-${String(refreshEndMonth).padStart(2, '0')}`;
 
@@ -576,19 +656,24 @@ async function pollRefreshTask(task, immediate = false) {
 
 async function finishRefreshTask(task) {
   clearTimeout(_refreshPollTimer);
-  const stillOnRefreshRange =
-    year.value === task.refreshYear &&
-    unit.value === task.refreshUnit &&
-    startMonth.value === task.refreshStartMonth &&
-    endMonth.value === task.refreshEndMonth;
-  if (stillOnRefreshRange) {
-    await reloadRange(
-      task.refreshStartPeriod ?? period.value,
-      (task.refreshStartMonth ?? startMonth.value) === (task.refreshEndMonth ?? endMonth.value)
-        ? ''
-        : (task.refreshEndPeriod ?? periodEnd.value),
-      true,
-    );
+  if (byYear.value && year.value === task.refreshYear && unit.value === task.refreshUnit) {
+    // 按年视图：预聚合刷新完成后强制重算整年（nocache 绕过 5 分钟年缓存）
+    await reloadRange(`${task.refreshYear}-01`, '', true);
+  } else {
+    const stillOnRefreshRange =
+      year.value === task.refreshYear &&
+      unit.value === task.refreshUnit &&
+      startMonth.value === task.refreshStartMonth &&
+      endMonth.value === task.refreshEndMonth;
+    if (stillOnRefreshRange) {
+      await reloadRange(
+        task.refreshStartPeriod ?? period.value,
+        (task.refreshStartMonth ?? startMonth.value) === (task.refreshEndMonth ?? endMonth.value)
+          ? ''
+          : (task.refreshEndPeriod ?? periodEnd.value),
+        true,
+      );
+    }
   }
   refreshing.value = false;
   activeRefreshTask.value = null;
@@ -606,7 +691,7 @@ function exportCsv() {
     `${displayCode(r.code)},${r.name},${fmtTarget(r.code)},${r.numerator??'/'},${r.denominator??'/'},${r.value == null ? '/' : `${r.value}${r.unit}`},${statusText(r.status)}`).join('\n');
   const blob = new Blob(['﻿'+header+body], { type:'text/csv;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-  a.download = `ICU质控_${period.value}.csv`; a.click();
+  a.download = byYear.value ? `ICU质控_${year.value}年.csv` : `ICU质控_${period.value}.csv`; a.click();
 }
 
 // =====《重症质控指标上报（2024年版）》按月导出 =====
@@ -702,6 +787,23 @@ window.addEventListener('target-config-updated', loadTargets);
   display:inline-flex; align-items:center; gap:6px; transition:all .2s; }
 .refresh-btn:hover:not(:disabled) { background:rgba(44,123,229,0.06); }
 .refresh-btn:disabled { opacity:.65; cursor:not-allowed; }
+/* 按年查询：与刷新按钮同款描边，激活时品牌色填充 */
+.year-btn { background:#fff; color:var(--brand); border:1px solid var(--brand);
+  border-radius:7px; padding:7px 16px; cursor:pointer; font-size:13px; font-weight:500;
+  transition:all .2s; white-space:nowrap; }
+.year-btn:hover { background:rgba(44,123,229,0.06); }
+.year-btn.active { background:var(--brand); color:#fff; }
+.year-btn.active:hover { background:var(--brand); opacity:.9; }
+
+/* 数据区 + 计算加载遮罩：按年查询/刷新期间盖住指标数据，阻止点按 */
+.data-area { position:relative; }
+.load-overlay { position:absolute; inset:0; z-index:30; display:flex; align-items:center; justify-content:center;
+  background:rgba(255,255,255,0.6); border-radius:8px; cursor:progress; }
+.load-box { display:flex; flex-direction:column; align-items:center; gap:12px;
+  padding:20px 32px; background:#fff; border:1px solid var(--border); border-radius:12px;
+  box-shadow:0 8px 28px rgba(16,30,54,0.14); }
+.load-spinner { width:24px !important; height:24px !important; border-width:2.5px !important; }
+.load-text { font-size:13px; font-weight:500; color:var(--text-main); letter-spacing:0.02em; }
 .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--brand);
   border-top-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }

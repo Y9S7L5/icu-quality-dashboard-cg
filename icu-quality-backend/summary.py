@@ -173,7 +173,7 @@ def _compute_icu05(dept_codes, start, end, hour):
     ]
 
     # Step 5: 应用人工排除
-    ex = apply_exclusions(f"ICU-05-{hour}", dept_codes, period, qualified_num, qualified_den)
+    ex = apply_exclusions(f"ICU-05-{hour}", dept_codes, period, qualified_num, qualified_den, end=end)
     num = len(ex["num_items"])
     den = len(ex["den_items"])
     val = round(num / den * 100, 1) if den > 0 else 0.0
@@ -256,8 +256,8 @@ def _compute_icu05(dept_codes, start, end, hour):
     shadow_num_3h_candidates = official_h3_in_shadow
 
     # Shadow 人工排除 (1h, 3h, 6h 分别排除，分母可能不同)
-    shadow_ex_1h = apply_exclusions(f"ICU-05-1h", dept_codes, period, shadow_num_1h_candidates, shadow_den_patients)
-    shadow_ex_3h = apply_exclusions(f"ICU-05-3h", dept_codes, period, shadow_num_3h_candidates, shadow_den_patients)
+    shadow_ex_1h = apply_exclusions(f"ICU-05-1h", dept_codes, period, shadow_num_1h_candidates, shadow_den_patients, end=end)
+    shadow_ex_3h = apply_exclusions(f"ICU-05-3h", dept_codes, period, shadow_num_3h_candidates, shadow_den_patients, end=end)
 
     # 6h shadow
     official_h6_in_shadow = [
@@ -273,7 +273,7 @@ def _compute_icu05(dept_codes, start, end, hour):
         if p.get("exclusion_key") not in seen_keys_6h:
             official_h6_in_shadow.append(p)
     shadow_num_6h_candidates = official_h6_in_shadow
-    shadow_ex_6h = apply_exclusions(f"ICU-05-6h", dept_codes, period, shadow_num_6h_candidates, shadow_den_patients)
+    shadow_ex_6h = apply_exclusions(f"ICU-05-6h", dept_codes, period, shadow_num_6h_candidates, shadow_den_patients, end=end)
 
     # 关键: 1h, 3h, 6h 各自使用自己的排除后分母
     shadow_den_1h = len(shadow_ex_1h["den_items"])
@@ -403,7 +403,7 @@ def _compute_icu05_cg(d, dept_codes, start, end, hour):
                      if p.get("exclusion_key") in den_keys]
 
     ex = apply_exclusions(f"ICU-05-{hour}", dept_codes, period,
-                          qualified_num, qualified_den)
+                          qualified_num, qualified_den, end=end)
     num = len(ex["num_items"])
     den = len(ex["den_items"])
     val = round(num / den * 100, 1) if den > 0 else 0.0
@@ -480,20 +480,40 @@ def _compute_icu07(dept_codes, start, end):
 EXCLUSION_COLLECTION = "icu_indicator_exclusion"
 
 
-def apply_exclusions(code, dept_codes, period, num_items, den_items):
-    # type: (str, list, str, list, list) -> dict
+def apply_exclusions(code, dept_codes, period, num_items, den_items, end: str = None):
+    # type: (str, list, str, list, list, str) -> dict
     """
     从分子/分母明细中剔除已排除的记录。
     返回 {num_items, den_items, excluded_num, excluded_den, raw_num, raw_den}
+    end: 统计窗口结束日（YYYY-MM-DD）。与 period 跨月时（按年窗口 Y-01-01~Y-12-31）
+         取区间内全部月份的人工排除并集；单月窗口行为不变。
     """
     dept_key = ",".join(dept_codes) if len(dept_codes) > 1 else dept_codes[0]
+    periods = [period]
+    if end:
+        try:
+            end_period = end[:7]
+            if end_period != period:
+                y1, m1 = map(int, period.split("-"))
+                y2, m2 = map(int, end_period.split("-"))
+                while (y1, m1) <= (y2, m2):
+                    p = f"{y1}-{m1:02d}"
+                    if p not in periods:
+                        periods.append(p)
+                    m1 += 1
+                    if m1 > 12:
+                        m1 = 1
+                        y1 += 1
+        except Exception:
+            pass
     excluded_keys = set()
     for db_name in BED_DB_NAMES:
         try:
             db = get_client(db_name)[db_name]
             coll = db[EXCLUSION_COLLECTION]
             docs = coll.find(
-                {"dept_code": dept_key, "period": period, "code": code, "excluded": True},
+                {"dept_code": dept_key, "period": {"$in": periods},
+                 "code": code, "excluded": True},
                 {"exclusion_key": 1, "_id": 0},
             )
             excluded_keys = {d["exclusion_key"] for d in docs}
@@ -522,7 +542,7 @@ def _compute_icu08(dept_codes, start, end):
     d = get_icu08_data(dept_codes, start, end)
     period = start[:7]  # "YYYY-MM"
     ex = apply_exclusions("ICU-08", dept_codes, period,
-                          d.get("num_patients", []), d.get("den_patients", []))
+                          d.get("num_patients", []), d.get("den_patients", []), end=end)
     raw_num = ex["raw_num"]
     raw_den = ex["raw_den"]
     excluded_num = ex["excluded_num"]

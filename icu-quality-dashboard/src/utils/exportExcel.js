@@ -39,6 +39,7 @@ function sanitizeFilename(s) {
 export async function exportDetailExcel(opts) {
   const {
     code, name, part, period, endPeriod = '',
+    byYear = false,
     unit, unitName = '',
     sourceDesc = '',
     patients: firstPage = [],
@@ -67,6 +68,7 @@ export async function exportDetailExcel(opts) {
         resp = await fetchDetail(code, period, part, unit, endPeriod, {
           limit: PAGE_SIZE,
           offset,
+          byYear,
         });
       } catch (e) {
         throw new Error(`第 ${rounds} 页拉取失败(offset=${offset}): ${e.message || e}`);
