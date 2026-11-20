@@ -59,8 +59,11 @@ log "编译二进制（首次约 3-6 分钟）"
 # shellcheck disable=SC2206
 CACHE_ARGS=(${DOCKER_CACHE_ARGS:-})
 if [ ${#CACHE_ARGS[@]} -gt 0 ]; then
+  # --load 必须带：container 驱动默认产物只进构建缓存，不载入本地镜像库，
+  # 后续 docker create/cp 取产物会报 "Unable to find image ... locally"
   "$ENGINE" buildx build \
     "${CACHE_ARGS[@]}" \
+    --load \
     --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
     -t "$IMAGE_NAME" -f "$DOCKERFILE" .
