@@ -222,9 +222,12 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
             logger.warning("report_export icu11 failed: %s", exc)
             d11 = None
         if d11 and (d11.get("den_patients") or d11.get("num_patients")):
-            vals["37"] = sum(1 for p in d11["num_patients"]
+            # 2026-11 口径：ICU-11 队列 = 同期ICU患者总数（统计期内在科记录），
+            # 37/38 临床死亡·自动出院从 den_patients（全队列）数转归，
+            # num_patients 现只含「死亡」（SMR 分子），不再承载 38 行
+            vals["37"] = sum(1 for p in d11["den_patients"]
                              if p.get("dischargedType") == "死亡")
-            vals["38"] = sum(1 for p in d11["num_patients"]
+            vals["38"] = sum(1 for p in d11["den_patients"]
                              if p.get("dischargedType") == "非医嘱离院")
             s_carry = s_new = 0.0
             for p in d11["den_patients"]:

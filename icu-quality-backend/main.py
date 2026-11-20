@@ -243,7 +243,13 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 40  # ICU-15 分母只取转出类型「转出」（2026-11 院方口径；出院/死亡/缺失不计）；
+CACHE_VERSION = 41  # ICU-11 标化病死指数口径改「同期ICU患者总数」（2026-11）——
+                    #      分母人群 = 统计期内在科记录（人次，与 ICU-04/07/09/10 同队列，
+                    #      含仍在科/无 APACHE 评分者，预计死亡率按 0 计）；
+                    #      分子只认转归=死亡（非医嘱离院不再计入）；
+                    #      实际/预计两率同除同期患者总数后约掉，指标值仍 = 死亡数 ÷ ΣcalDead；
+                    #      上报表 37/38 改由 den_patients 数转归；旧明细作废
+                    # v40: ICU-15 分母只取转出类型「转出」（2026-11 院方口径；出院/死亡/缺失不计）；
                     #      ICU-18 命中依据改诊断名称（查 VI_ICU_ICD 字典，原纯 ICD 码）；旧缓存作废
                     # v39: 明细住院号 patient_id 改 mrn 优先（原 hisPid 优先；本院两套编号）
                     #      脓毒性休克/感染性休克(在科重叠月,无三道门)，分子=窗口四项
@@ -694,7 +700,8 @@ SOURCE_DESC = {
     "ICU-08": {"numerator": "分母患者统计月内有俯卧位记录(param_TiWei)的患者数", "denominator": "同期ICU中临床诊断(clinicalDiagnosis)含「呼吸窘迫综合征」或「ARDS」的患者数"},
     "ICU-09": {"numerator": "本次住院期间进行镇痛评分(NRS/CPOT/BPS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
     "ICU-10": {"numerator": "本次住院期间进行镇静评分(RASS/SAS)测定的在科人次", "denominator": "同期在科记录数（人次口径，一次入科一人次）"},
-    "ICU-11": {"numerator": "实际死亡患者总数", "denominator": "预计死亡概率(SMR公式计算)累计总和"},
+    "ICU-11": {"numerator": "实际死亡患者总数（转归=死亡）",
+               "denominator": "预计死亡概率(SMR公式计算)累计总和；两率同除「同期ICU患者总数」后约掉"},
     "ICU-12": {"numerator": "非计划自行拔除气管导管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
     "ICU-13": {"numerator": "气管插管拔除后48小时内重新插管的例数", "denominator": "行气管插管机械通气拔管的总例数"},
     "ICU-14": {"numerator": "非计划由手术室/病房转入ICU的患者数", "denominator": "同期手术后入ICU患者的总人数"},
@@ -1870,6 +1877,9 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
             return items
 
     # ---- ICU-11：标化病死指数(SMR)明细 ----
+    # 2026-11 口径：分母明细 = 同期ICU患者总数（统计期内在科记录，人次口径），
+    # 无 APACHE 预计死亡率的行 value 为空（预计死亡率按 0 计入分子分母求和）；
+    # 分子明细只列转归=死亡（非医嘱离院不计）
     if code == "ICU-11":
         data = get_icu11_data(dept_codes, start_date, end_date)
         src = data.get("num_patients" if part == "numerator" else "den_patients", [])
@@ -1877,9 +1887,10 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
         for p in src:
             at = p.get("apache_time")
             dt_out = p.get("icu_discharge")
-            cal_dead = p.get("apache_calDead", 0)
+            cal_dead = p.get("apache_calDead")
             items.append({
                 "patient_id": p.get("patient_id", p.get("mrn", "")),
+                "detail_id": str(p.get("_id", "")),   # 在科记录 _id，多次入科可区分
                 "name": p.get("name", ""),
                 "gender": "", "age": "",
                 "bed_no": p.get("dischargedType", ""),
@@ -1887,7 +1898,9 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all"):
                 "admit_time": fmt_bj(at),
                 "discharge_time": fmt_bj(dt_out),
                 "admission_source": "",
-                "value": round(cal_dead, 4) if isinstance(cal_dead, (int, float)) else cal_dead,
+                "patient_type": "原有" if p.get("icu_admit") and p["icu_admit"] < start_dt else "新入",
+                "eval_status": "已评" if cal_dead is not None else "未评",
+                "value": round(cal_dead, 4) if isinstance(cal_dead, (int, float)) else None,
             })
         _enrich_admission_discharge(items, dept_codes)
         return items
@@ -3228,6 +3241,8 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
     # 各指标明细描述
     # ICU-05: 附加原因分布（#设计: 三色语义 — 红=明确未达标 / 橙=顺序问题 / 灰=数据缺失）
     reason_summary = None
+    # 分项小计（ICU-11：原有/新入 Σ预计病死率），随 result 下发给详情弹窗
+    extra = None
     if code.startswith("ICU-05") and part == "denominator":
         def _agg_reasons(patients):
             done = failed = uncertain = 0
@@ -3331,8 +3346,53 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         source_desc = "分子：分母队列中本次住院期间（含入科当月、不只统计月内）有镇静评分（RASS等）的在科记录，明细展示评分中文名、分值和时间" if part == "numerator" \
             else "分母：统计期内在科记录（人次口径 —— 一条在科记录一人次，不按住院号去重）"
     elif code == "ICU-11":
-        source_desc = "分子：已结案完整病例中在院死亡或非医嘱离院的患者数" if part == "numerator" \
-            else "分母：死亡、出院、非医嘱离院且有APACHEⅡ预计死亡率评分病例的预计死亡率之和（评分不限评估时间，多条按统计月取最近一次）"
+        # 2026-11 口径：两率同除「同期ICU患者总数」，明细即按该队列出
+        # 原有/新入拆分（patient_type，入科早于期初=原有）——
+        #   Σ预计死亡率 按类型分项 = 上报表 45.1 / 45.2 同口径
+        if part == "denominator":
+            _icu11_den_rows = items
+        else:
+            try:
+                _icu11_den_rows = _detail_cache_payload(code, period, "denominator",
+                                                        icu_unit, nocache=nocache)
+            except Exception:
+                _icu11_den_rows = []
+        _icu11_total = len(_icu11_den_rows)
+        _icu11_exp = sum(p.get("value") for p in _icu11_den_rows
+                         if isinstance(p.get("value"), (int, float)))
+        _icu11_carry = [p for p in _icu11_den_rows if p.get("patient_type") == "原有"]
+        _icu11_new = [p for p in _icu11_den_rows if p.get("patient_type") == "新入"]
+        _icu11_exp_carry = sum(p.get("value") for p in _icu11_carry
+                               if isinstance(p.get("value"), (int, float)))
+        _icu11_exp_new = sum(p.get("value") for p in _icu11_new
+                             if isinstance(p.get("value"), (int, float)))
+        extra = {
+            "label": "预计病死率总和",
+            "total": round(_icu11_exp, 4),
+            "total_count": _icu11_total,
+            "carry_in": round(_icu11_exp_carry, 4),
+            "carry_in_count": len(_icu11_carry),
+            "new": round(_icu11_exp_new, 4),
+            "new_count": len(_icu11_new),
+        }
+
+        if part == "numerator":
+            _icu11_act = len(items)
+            _icu11_rate = f"{_icu11_act / _icu11_total * 100:.2f}%" if _icu11_total else "—"
+            source_desc = (f"分子：转归=「死亡」的在科记录 {_icu11_act} 人次"
+                           f" ÷ 同期ICU患者总数 {_icu11_total} 人次 = 实际病死率 {_icu11_rate}。"
+                           "非医嘱离院不计入分子（上报表 43 行另计）；"
+                           "SMR = 实际病死率 ÷ 预计病死率，两率同除同期ICU患者总数后约掉，"
+                           "故指标值仍 = 死亡人数 ÷ Σ预计死亡率")
+        else:
+            _icu11_rate = f"{_icu11_exp / _icu11_total * 100:.2f}%" if _icu11_total else "—"
+            source_desc = (f"分母：同期ICU患者总数 {_icu11_total} 人次 —— 统计期内在科记录"
+                           "（deptCode 命中、排除 invalid、入出科时间与统计期有交集；"
+                           "人次口径一次入科一人次，与 ICU-04/07/09/10 同队列，"
+                           "含仍在科未出科者）。预计病死率 = Σ每例 APACHEⅡ 预计死亡率 "
+                           f"{_icu11_exp:.4f} ÷ {_icu11_total} = {_icu11_rate}；"
+                           "无有效预计死亡率的行显示为空、按 0 计入求和"
+                           "（评分不限评估时间，多条按统计月取月末前最近一次）")
     elif code == "ICU-12":
         source_desc = "分子：气管插管/气插管/气切套管拔管记录中 unPlannedEndTube 为 true 的非计划拔管，已排除换管" if part == "numerator" \
             else "分母：统计期内气管插管/气插管/气切套管拔管记录，已排除 replace=true 换管"
@@ -3367,6 +3427,8 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
     }
     if reason_summary is not None:
         result["reason_summary"] = reason_summary
+    if extra is not None:
+        result["extra"] = extra
     _cache_set(ck, result)
     paged = dict(result)
     paged["limit"] = limit

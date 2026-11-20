@@ -59,6 +59,26 @@
       <span v-if="exportError" class="export-error">{{ exportError }}</span>
     </div>
 
+    <!-- ICU-11：Σ预计病死率 按 原有/新入 分项（= 上报表 45.1 / 45.2 同口径） -->
+    <div v-if="extraStat && extraStat.total_count > 0" class="stat-strip">
+      <span class="ss-title">{{ extraStat.label }}</span>
+      <span class="ss-cell ss-lead">
+        <b>{{ fmtNum(extraStat.total) }}</b>
+        <small>合计 · {{ extraStat.total_count }} 人次</small>
+      </span>
+      <span class="ss-op">=</span>
+      <span class="ss-cell">
+        <b>{{ fmtNum(extraStat.carry_in) }}</b>
+        <small>原有 · {{ extraStat.carry_in_count }} 人次</small>
+      </span>
+      <span class="ss-op">+</span>
+      <span class="ss-cell">
+        <b>{{ fmtNum(extraStat.new) }}</b>
+        <small>新入 · {{ extraStat.new_count }} 人次</small>
+      </span>
+      <span class="ss-note">原有 = 入科早于统计期初；与上报表 45.1 / 45.2 同口径</span>
+    </div>
+
     <!-- P2: 三色原因分布（红=明确未达标 / 橙=顺序 / 灰=数据缺失·未确认），点击筛选 -->
     <div v-if="isIcu05 && reasonSummary" class="reason-bar">
       <div class="rb-head">
@@ -263,6 +283,15 @@ function setPart(part) {
   if (props.parts && props.parts[part]) activePart.value = part;
 }
 
+// ── ICU-11：Σ预计病死率 按 原有/新入 分项（后端 extra；分子 tab 也读得到，同队列同数）──
+const extraStat = computed(() =>
+  activeData.value?.extra || props.parts?.denominator?.extra || props.data?.extra || null);
+// 数值展示：最多 4 位小数，去掉尾随 0（0 → 0、3.5888 → 3.5888）
+function fmtNum(v) {
+  if (typeof v !== 'number' || !isFinite(v)) return '—';
+  return String(Math.round(v * 10000) / 10000);
+}
+
 // ── P2: 原因分布（来自分母 payload）──
 const reasonSummary = computed(() => {
   if (props.parts?.denominator?.reason_summary) return props.parts.denominator.reason_summary;
@@ -350,7 +379,7 @@ const canExclude = computed(() => EXCLUSION_SUPPORTED_CODES.includes(props.data?
 const excludedCount = computed(() => (activeData.value?.patients || []).filter(p => p.excluded).length);
 const patientTypeFilter = ref('');
 // 分母 = 同期ICU患者总数（人次口径）的指标：分子/分母明细都提供 原有/新入/出科/未评 筛选
-const TYPE_FILTER_CODES = ['ICU-00', 'ICU-04-01', 'ICU-04-02', 'ICU-04-03', 'ICU-04-04', 'ICU-04-05', 'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10'];
+const TYPE_FILTER_CODES = ['ICU-00', 'ICU-04-01', 'ICU-04-02', 'ICU-04-03', 'ICU-04-04', 'ICU-04-05', 'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10', 'ICU-11'];
 const hasPatientType = computed(() => TYPE_FILTER_CODES.includes(activeData.value?.code));
 // 「未评」仅分母维度（ICU-07 是 DVT，标签 未预防；ICU-00 无评估语义）
 const evalFilterLabel = computed(() => activeData.value?.code === 'ICU-07' ? '未预防' : '未评');
@@ -531,6 +560,26 @@ const rowClass = (p) => {
 .export-progress { color:var(--text-sub); }
 .export-error { color:var(--danger); }
 .excl-count { color:var(--warn); font-weight:600; font-size:13px; }
+
+/* ── ICU-11：Σ预计病死率 按 原有/新入 分项小计（口径行下方常驻） ── */
+.stat-strip {
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  margin:0 0 14px; padding:9px 12px;
+  background:var(--bg-surface); border:1px solid var(--border); border-radius:6px;
+}
+.ss-title {
+  font-size:12px; font-weight:600; color:var(--text-title);
+  background:var(--brand-weak); padding:2px 8px; border-radius:4px;
+}
+.ss-cell { display:flex; flex-direction:column; align-items:flex-start; }
+.ss-cell b {
+  font-size:17px; line-height:1.2; color:var(--brand); font-weight:700;
+  font-variant-numeric:tabular-nums;
+}
+.ss-cell.ss-lead b { font-size:20px; }
+.ss-cell small { font-size:11px; color:var(--text-sub); }
+.ss-op { font-size:15px; font-weight:600; color:var(--text-sub); }
+.ss-note { margin-left:auto; font-size:11px; color:var(--text-faint); }
 
 /* ── P2: 公式条 ── */
 .formula-row { display:flex; gap:12px; margin-bottom:10px; flex-wrap:wrap; }

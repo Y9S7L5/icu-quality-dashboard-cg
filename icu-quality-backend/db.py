@@ -899,7 +899,8 @@ def get_icu_denominator_stays(dept_codes: list, start_date: str, end_date: str) 
     条件：deptCode 属于本科室、status != invalid、
           icuAdmissionTime <= 期末 且 (icuDischargeTime >= 期初 或 未出院)。
 
-    ICU-04-01、ICU-07 等分母共用此查询，保证分子分母来自同一队列。
+    ICU-04-01、ICU-07、ICU-11（同期ICU患者总数）等分母共用此查询，
+    保证分子分母来自同一队列。投影含 dischargedType（ICU-11 判死亡用）。
     """
     from datetime import datetime as dt
 
@@ -921,7 +922,8 @@ def get_icu_denominator_stays(dept_codes: list, start_date: str, end_date: str) 
                     ],
                 },
                 {"_id": 1, "mrn": 1, "hisPid": 1, "patientId": 1, "name": 1,
-                 "hisBed": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1, "deptCode": 1},
+                 "hisBed": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1,
+                 "deptCode": 1, "dischargedType": 1},
             ))
         except Exception as _exc:
             logger.warning("DB %s failed in get_icu_denominator_stays: %s", _db_name, _exc)
@@ -4766,58 +4768,62 @@ def _as_float_or_none(value):
 
 def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
     """
-    ICU-11：ICU患者标化病死指数(SMR)。
+    ICU-11：ICU患者标化病死指数(SMR) —— 2026-11 新口径。
 
-    分母人群 = 同期出科且 dischargedType 为“死亡/出院/非医嘱离院”，并有
-    APACHE II 预计死亡率（apacheII.calDead.score ∈ [0,1]）的完整病例。
-    评分选取（2026-11 口径）：不限评估时间窗（入科 24h 约束已取消），
-    多条按统计月取月末前最近一次（_pick_apache_score）。
-    分母数值 = 每例所取 APACHE II apacheII.calDead.score 之和。
-    分子 = 同一人群中 dischargedType 为“死亡/非医嘱离院”的人数。
+    同期ICU患者总数 = 统计期内在科记录（**人次口径**，与 ICU-04/07/09/10
+        同队列 —— get_icu_denominator_stays：deptCode 命中、status != invalid、
+        入出科时间与统计期有交集）。含仍在科未出科者、含无 APACHE 评分者。
 
-    返回 {den_count, num_count, value, den_patients, num_patients}
+        预计病死率 = Σ每例 APACHE Ⅱ 预计死亡率(apacheII.calDead.score) ÷ 同期ICU患者总数
+        实际病死率 = 实际死亡人数(dischargedType == "死亡") ÷ 同期ICU患者总数
+    SMR = 实际病死率 ÷ 预计病死率 = 实际死亡人数 ÷ ΣcalDead.score
+        （两率共用同一分母，约掉；故 den_count 仍存 ΣcalDead、num_count 存死亡人数，
+          summary.py 直接 num/den 即得 SMR）
+
+    口径要点：
+      · 无有效 calDead 评分的在科记录仍计入「同期ICU患者总数」，预计死亡率按 0 计
+        —— 不再像旧口径那样把无评分者整例剔出分母；
+      · 分子只认 dischargedType == "死亡"，非医嘱离院不再计入（旧口径两者都算），
+        故死亡者即使没有 APACHE 评分也会计入分子；
+      · 评分不限评估时间窗（入科 24h 约束已废止），多条按统计月取月末前最近一次
+        （_pick_apache_score）；calDead 必须能转 float 且落在 [0,1]。
+
+    返回 {den_count(ΣcalDead), num_count(死亡人数), value(SMR),
+          total_count(同期患者总数), expected_rate, actual_rate,
+          den_patients, num_patients}
     """
-    start_dt = utc_day_start(start_date)
-    end_dt = utc_day_start(end_date)
     end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
         "den_count": 0.0,
         "num_count": 0,
         "value": 0.0,
+        "total_count": 0,
+        "expected_rate": 0.0,
+        "actual_rate": 0.0,
         "den_patients": [],
         "num_patients": [],
     }
 
-    death_types = {"死亡", "非医嘱离院"}
-    closed_types = {"出院", *death_types}
+    # 分母人群：统计期内在科记录（人次），与 ICU-04-01/ICU-07 同队列
+    stays = get_icu_denominator_stays(dept_codes, start_date, end_date)
+    stay_map = {str(p["_id"]): p for p in stays}
+    stay_ids = list(stay_map.keys())
+    total_count = len(stay_map)
+    result["total_count"] = total_count
+    if not stay_ids:
+        return result
+
+    picked_by_pid = {}
 
     for db_name, db in iter_bed_dbs():
         try:
-
-            patients = list(db.patient.find(
+            # 拉取分母队列全部 apacheII 评分（不限评估时间、不限月初），
+            # 只保留 calDead 有效的，再按统计月取「月末前最近一次」
+            usable_by_pid = defaultdict(list)
+            for doc in db.score.find(
                 {
-                    "deptCode": {"$in": dept_codes},
-                    "status": {"$ne": "invalid"},
-                    "icuDischargeTime": {"$gte": start_dt, "$lte": end_dt_wide},
-                    "dischargedType": {"$in": list(closed_types)},
-                },
-                {
-                    "_id": 1, "hisPid": 1, "mrn": 1, "name": 1,
-                    "deptCode": 1, "icuAdmissionTime": 1, "icuDischargeTime": 1,
-                    "dischargeTime": 1, "dischargedType": 1,
-                },
-            ).max_time_ms(10000).limit(200000))
-
-            if not patients:
-                continue
-
-            pat_by_pid = {str(p["_id"]): p for p in patients}
-            pids = list(pat_by_pid.keys())
-
-            score_docs = list(db.score.find(
-                {
-                    "pid": {"$in": pids},
+                    "pid": {"$in": stay_ids},
                     "scoreType": "apacheII",
                     "valid": True,
                 },
@@ -4825,14 +4831,9 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "pid": 1, "time": 1, "total": 1,
                     "apacheII.calDead.score": 1,
                 },
-            ).sort("time", 1).max_time_ms(15000).limit(300000))
-
-            # 2026-11 口径：不再限入科 24h 窗口——只要有带有效 calDead 的
-            # apacheII 评分即入组；多条按统计月取月末前最近一次
-            usable_by_pid = defaultdict(list)
-            for doc in score_docs:
+            ).sort("time", 1).max_time_ms(15000).limit(300000):
                 spid = doc.get("pid")
-                if spid not in pat_by_pid:
+                if spid not in stay_map:
                     continue
                 cal_dead = (((doc.get("apacheII") or {}).get("calDead") or {}).get("score"))
                 cal_dead = _as_float_or_none(cal_dead)
@@ -4841,49 +4842,54 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                 doc["_cal_dead"] = cal_dead
                 usable_by_pid[spid].append(doc)
 
-            picked_score_by_pid = {}
             for spid, docs in usable_by_pid.items():
                 doc = _pick_apache_score(docs, end_dt_wide)
-                if not doc:
-                    continue
-                picked_score_by_pid[spid] = {
-                    "time": doc.get("time"),
-                    "total": doc.get("total"),
-                    "cal_dead": doc["_cal_dead"],
-                }
+                if doc:
+                    picked_by_pid[spid] = doc
 
             den_patients = []
             num_patients = []
             expected_deaths = 0.0
             actual_deaths = 0
 
-            for spid, score in picked_score_by_pid.items():
-                pat = pat_by_pid[spid]
-                discharged_type = pat.get("dischargedType", "")
-                expected_deaths += score["cal_dead"]
-                if discharged_type in death_types:
+            for spid, stay in stay_map.items():
+                s = picked_by_pid.get(spid)
+                cal_dead = s.get("_cal_dead") if s else None
+                if cal_dead is not None:
+                    # 统一到 4 位小数再累加：明细「预计死亡率」列、
+                    # 汇总 den_count、上报表 40.1/40.2 三处同源，
+                    # 保证用户拿明细列求和 = 公式条分母
+                    cal_dead = round(cal_dead, 4)
+                    expected_deaths += cal_dead
+                discharged_type = stay.get("dischargedType") or ""
+                if discharged_type == "死亡":
                     actual_deaths += 1
 
                 item = {
+                    "_id": stay.get("_id"),      # 在科记录 _id → 明细 detail_id（人次区分）
                     "pid": spid,
-                    "mrn": pat.get("mrn", "") or pat.get("hisPid", ""),
-                    "patient_id": pat.get("mrn", "") or pat.get("hisPid", ""),
-                    "name": pat.get("name", ""),
-                    "dept_code": pat.get("deptCode", ""),
-                    "icu_admit": pat.get("icuAdmissionTime"),
-                    "icu_discharge": pat.get("icuDischargeTime") or pat.get("dischargeTime"),
+                    "mrn": stay.get("mrn", "") or stay.get("hisPid", ""),
+                    "patient_id": stay.get("mrn", "") or stay.get("hisPid", ""),
+                    "name": stay.get("name", ""),
+                    "dept_code": stay.get("deptCode", ""),
+                    "hisBed": stay.get("hisBed", ""),
+                    "patientId": stay.get("patientId", ""),
+                    "icu_admit": stay.get("icuAdmissionTime"),
+                    "icu_discharge": stay.get("icuDischargeTime"),
                     "dischargedType": discharged_type,
-                    "apache_time": score["time"],
-                    "apache_total": score.get("total"),
-                    "apache_calDead": score["cal_dead"],
+                    "apache_time": s.get("time") if s else None,
+                    "apache_total": s.get("total") if s else None,
+                    "apache_calDead": cal_dead,
                 }
                 den_patients.append(item)
-                if discharged_type in death_types:
+                if discharged_type == "死亡":
                     num_patients.append(item)
 
             result["den_count"] = round(expected_deaths, 4)
             result["num_count"] = actual_deaths
             result["value"] = round(actual_deaths / expected_deaths, 2) if expected_deaths > 0 else 0.0
+            result["expected_rate"] = round(expected_deaths / total_count, 4) if total_count else 0.0
+            result["actual_rate"] = round(actual_deaths / total_count, 4) if total_count else 0.0
             result["den_patients"] = den_patients
             result["num_patients"] = num_patients
             break
@@ -4892,6 +4898,7 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
             print(f"[ICU-11] Error in db {db_name}: {e}")
             import traceback
             traceback.print_exc()
+            picked_by_pid = {}
             continue
 
     return result

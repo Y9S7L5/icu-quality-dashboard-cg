@@ -556,7 +556,12 @@ def _compute_icu10(dept_codes, start, end):
 
 
 def _compute_icu11(dept_codes, start, end):
-    """ICU-11: ICU患者标化病死指数(SMR)"""
+    """ICU-11: ICU患者标化病死指数(SMR)
+
+    2026-11 口径：实际病死率、预计病死率同除「同期ICU患者总数」（统计期内
+    在科记录，人次口径），比值中该分母约掉，故存 num=实际死亡人数、
+    den=Σ每例 APACHE Ⅱ 预计死亡率，val = num/den 即 SMR。
+    """
     d = get_icu11_data(dept_codes, start, end)
     num = d["num_count"]
     den = d["den_count"]

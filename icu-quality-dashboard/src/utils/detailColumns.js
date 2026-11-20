@@ -198,7 +198,7 @@ function resolveCol5Header(code, part) {
 // 与 DetailModal.vue 的 TYPE_FILTER_CODES 一一对应
 const TYPE_TAG_CODES = [
   'ICU-04-01', 'ICU-04-02', 'ICU-04-03', 'ICU-04-04', 'ICU-04-05',
-  'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10',
+  'ICU-04-06', 'ICU-04-07', 'ICU-07', 'ICU-09', 'ICU-10', 'ICU-11',
 ]
 
 // 分母状态列表头：评估/评分类 → 评估状态(未评/已评)；DVT → 预防状态(未预防/已预防)
