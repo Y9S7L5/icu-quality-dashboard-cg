@@ -224,11 +224,14 @@ def compute_report_values(period: str, icu_unit: str = "all") -> dict:
         if d11 and (d11.get("den_patients") or d11.get("num_patients")):
             # 2026-11 口径：ICU-11 队列 = 同期ICU患者总数（统计期内在科记录），
             # 37/38 临床死亡·自动出院从 den_patients（全队列）数转归，
-            # num_patients 现只含「死亡」（SMR 分子），不再承载 38 行
+            # num_patients 现只含「死亡」（SMR 分子），不再承载 38 行；
+            # 转归须出科时间落在本期才计入——11 月死亡不算入 10 月
             vals["37"] = sum(1 for p in d11["den_patients"]
-                             if p.get("dischargedType") == "死亡")
+                             if p.get("dischargedType") == "死亡"
+                             and p.get("discharged_in_period"))
             vals["38"] = sum(1 for p in d11["den_patients"]
-                             if p.get("dischargedType") == "非医嘱离院")
+                             if p.get("dischargedType") == "非医嘱离院"
+                             and p.get("discharged_in_period"))
             s_carry = s_new = 0.0
             for p in d11["den_patients"]:
                 v = p.get("apache_calDead") or 0

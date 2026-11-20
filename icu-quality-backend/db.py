@@ -4785,13 +4785,18 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
         —— 不再像旧口径那样把无评分者整例剔出分母；
       · 分子只认 dischargedType == "死亡"，非医嘱离院不再计入（旧口径两者都算），
         故死亡者即使没有 APACHE 评分也会计入分子；
+      · **死亡按出科时间落在统计期内计入本期分子**——10 月在科、11 月才死亡的
+        不算入 10 月（死在哪个月算哪个月）；分母仍按在科人次（跨月各计一次）；
       · 评分不限评估时间窗（入科 24h 约束已废止），多条按统计月取月末前最近一次
         （_pick_apache_score）；calDead 必须能转 float 且落在 [0,1]。
 
     返回 {den_count(ΣcalDead), num_count(死亡人数), value(SMR),
           total_count(同期患者总数), expected_rate, actual_rate,
           den_patients, num_patients}
+          （den_patients 每行带 discharged_in_period：出科时间是否落在统计期内，
+            上报表 37/38 按它做当月死亡归属）
     """
+    start_dt = utc_day_start(start_date)
     end_dt_wide = utc_day_end_wide(end_date)
 
     result = {
@@ -4862,7 +4867,12 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     cal_dead = round(cal_dead, 4)
                     expected_deaths += cal_dead
                 discharged_type = stay.get("dischargedType") or ""
-                if discharged_type == "死亡":
+                # 死亡时间归属：出科(死亡)时间必须落在统计期内才计入本期分子——
+                # 10 月在科、11 月死亡的不算入 10 月（死在哪个月算哪个月）
+                dis_dt = stay.get("icuDischargeTime")
+                dis_in_period = isinstance(dis_dt, datetime) and start_dt <= dis_dt <= end_dt_wide
+                died_in_period = discharged_type == "死亡" and dis_in_period
+                if died_in_period:
                     actual_deaths += 1
 
                 item = {
@@ -4877,12 +4887,13 @@ def get_icu11_data(dept_codes: list, start_date: str, end_date: str) -> dict:
                     "icu_admit": stay.get("icuAdmissionTime"),
                     "icu_discharge": stay.get("icuDischargeTime"),
                     "dischargedType": discharged_type,
+                    "discharged_in_period": dis_in_period,
                     "apache_time": s.get("time") if s else None,
                     "apache_total": s.get("total") if s else None,
                     "apache_calDead": cal_dead,
                 }
                 den_patients.append(item)
-                if discharged_type == "死亡":
+                if died_in_period:
                     num_patients.append(item)
 
             result["den_count"] = round(expected_deaths, 4)

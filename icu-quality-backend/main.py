@@ -245,7 +245,11 @@ def _cache_clear():
 
 DETAIL_CACHE_COLLECTION = "icu_indicator_detail_cache"
 # 缓存版本号：修改口径时 +1，旧条目自然失效
-CACHE_VERSION = 41  # ICU-11 标化病死指数口径改「同期ICU患者总数」（2026-11）——
+CACHE_VERSION = 42  # ICU-11 明细补「APACHEⅡ评分」列——分数紧跟评分时间、预计死亡率
+                    #      随其后（行数据补 apache_total）；死亡按出科时间归属统计期
+                    #      （11 月死亡不算入 10 月，SMR 分子/上报表 37/38 同步）；
+                    #      旧明细无新字段且分子行集变化，作废重算
+                    # v41: ICU-11 标化病死指数口径改「同期ICU患者总数」（2026-11）——
                     #      分母人群 = 统计期内在科记录（人次，与 ICU-04/07/09/10 同队列，
                     #      含仍在科/无 APACHE 评分者，预计死亡率按 0 计）；
                     #      分子只认转归=死亡（非医嘱离院不再计入）；
@@ -1928,6 +1932,7 @@ def query_detail(code: str, period: str, part: str, icu_unit: str = "all", end_d
                 "admission_source": "",
                 "patient_type": "原有" if p.get("icu_admit") and p["icu_admit"] < start_dt else "新入",
                 "eval_status": "已评" if cal_dead is not None else "未评",
+                "apache_total": p.get("apache_total"),  # APACHEⅡ总分（与评分时间同一次取值）
                 "value": round(cal_dead, 4) if isinstance(cal_dead, (int, float)) else None,
             })
         _enrich_admission_discharge(items, dept_codes)
@@ -3528,9 +3533,9 @@ def indicator_detail(code: str, period: str, part: str, icu_unit: str = "all", e
         if part == "numerator":
             _icu11_act = len(items)
             _icu11_rate = f"{_icu11_act / _icu11_total * 100:.2f}%" if _icu11_total else "—"
-            source_desc = (f"分子：转归=「死亡」的在科记录 {_icu11_act} 人次"
+            source_desc = (f"分子：出科（死亡）时间落在统计期内、转归=「死亡」的在科记录 {_icu11_act} 人次"
                            f" ÷ 同期ICU患者总数 {_icu11_total} 人次 = 实际病死率 {_icu11_rate}。"
-                           "非医嘱离院不计入分子（上报表 43 行另计）；"
+                           "（死在哪个月算哪个月——11 月死亡不计入 10 月；非医嘱离院不计入分子，上报表 43 行另计）；"
                            "SMR = 实际病死率 ÷ 预计病死率，两率同除同期ICU患者总数后约掉，"
                            "故指标值仍 = 死亡人数 ÷ Σ预计死亡率")
         else:

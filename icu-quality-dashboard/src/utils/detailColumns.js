@@ -219,6 +219,14 @@ function resolveDefaultCols(code, part) {
     { header: resolveCol3Header(code, part), get: (p) => fmtText(p.bed_no) },
     { header: col4Header, get: (p) => fmtDate(p.admit_time) },
   ]
+  // ICU-11：APACHEⅡ分数紧跟评分时间，预计死亡率再随其后（分数→预计死亡率连读），
+  // 故 value 列提前到此处，末尾不再重复 push
+  if (code === 'ICU-11') {
+    base.push(
+      { header: 'APACHEⅡ评分', get: (p) => fmtText(p.apache_total ?? '—') },
+      { header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') },
+    )
+  }
   // col4 已是「入科时间」的指标（01 分子、04 分母、07 分母等）不重复；
   // col4 被复用为他义的（06 送检/给药、07 医嘱示例、08 俯卧、11 APACHE、
   // 04 分子评分时间）补统一入科时间列
@@ -235,7 +243,9 @@ function resolveDefaultCols(code, part) {
     base.push({ header: '患者类型', get: (p) => fmtText(p.patient_type || '/') })
   }
   base.push({ header: '主治医生', get: (p) => fmtText(p.bed_physician) || '/' })
-  base.push({ header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') })
+  if (code !== 'ICU-11') {
+    base.push({ header: resolveCol5Header(code, part), get: (p) => fmtText(p.value ?? '—') })
+  }
   if (TYPE_TAG_CODES.includes(code) && part === 'denominator') {
     base.push({ header: evalStatusHeader(code), get: (p) => fmtText(p.eval_status || '/') })
   }
